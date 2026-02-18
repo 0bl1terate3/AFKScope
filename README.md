@@ -53,6 +53,7 @@
 ## Why StayActive
 
 - Handles multiple Roblox instances with per-instance control.
+- Automatically closes Roblox singleton event handles on launch, so you can run multiple Roblox instances at the same time natively.
 - Sends anti-AFK jumps with focus spoofing (`All-at-once` and `Round-robin`).
 - Tracks identity + avatars and gives confidence labels for lookups.
 - Includes biome monitoring, rare-biome webhook alerts, and diagnostics export.
@@ -108,6 +109,7 @@ pip install pystray pillow
 ## Highlights
 
 - Multi-instance detection with enable/disable toggles per window.
+- Automatic singleton-event cleanup when Roblox opens, enabling native multi-instance launches.
 - Focus-spoofed jump dispatch via ViGEmBus + `vgamepad`.
 - Biome badge/history + rare biome Discord webhook alerts.
 - Header theme dropdown with many distinct color themes.
@@ -120,6 +122,7 @@ pip install pystray pillow
 - One-click clipboard support bundle for faster troubleshooting.
 - Smart anti-idle patterns: `balanced`, `subtle`, `aggressive`, `randomized`.
 - Identity detection from logs with Roblox API enrichment.
+- Improved identity mapping reliability with stronger log matching and username/userId pairing.
 - Session stats, watchdog recovery sequence, and safe pause schedule.
 - In-app update checks + release page shortcut.
 - Config/preset validation improvements (pause schedule + webhook URL checks).
@@ -127,14 +130,13 @@ pip install pystray pillow
 - Dedicated StayActive header logo for clearer branding/readability.
 - Event timeline panel and copy-to-clipboard diagnostics utilities.
 
-## Patch Notes (v0.1)
+## Patch Notes (v0.1.4)
 
-- Added first-launch Quick Setup Wizard.
-- Added global hotkeys (`Ctrl+Alt+S/J/R/T`) for common actions.
-- Added Theme Maker import/export for JSON theme files.
-- Added instance health alerts for stale/no-jump enabled instances.
-- Added auto-save recovery snapshots plus restore prompt after unclean shutdown.
-- Added one-click clipboard support bundle for diagnostics + recent events/logs.
+- Made it so whenever you launch Roblox, StayActive automatically closes the singleton event, allowing you to run multiple Roblox instances at the same time natively.
+- Improved singleton-event cleanup reliability with global handle scanning, forced source-handle close behavior, and short retry passes.
+- Enables `SeDebugPrivilege` at startup so handle cleanup can run consistently.
+- Improved username/avatar identity mapping with stronger log extraction and tighter username/userId pairing.
+- Expanded runtime diagnostics for cleanup attempts (privilege state, scan counts, and retry outcomes).
 
 ## Previous Notes
 
@@ -151,13 +153,13 @@ Fast path (recommended):
 
 ```powershell
 py -3.10 -m pip install --upgrade pyinstaller vgamepad pystray pillow
-py -3.10 -m PyInstaller --noconfirm --onefile --windowed --name StayActive --icon "STAYACTIVE ICON.ico" --add-data "STAYACTIVE ICON.ico;." --add-data "assets/stayactive-header-logo.png;assets" --collect-binaries vgamepad --collect-data vgamepad --collect-submodules vgamepad main.py
+py -3.10 -m PyInstaller --noconfirm --clean --onefile --windowed --uac-admin --name StayActive --add-data "STAYACTIVE ICON.png;." --collect-binaries vgamepad --collect-data vgamepad --collect-submodules vgamepad main.py
 ```
 
 Standard path:
 
 ```powershell
-python -m PyInstaller --noconfirm --onefile --windowed --name StayActive --icon "STAYACTIVE ICON.ico" --add-data "STAYACTIVE ICON.ico;." --add-data "assets/stayactive-header-logo.png;assets" --collect-binaries vgamepad --collect-data vgamepad --collect-submodules vgamepad main.py
+python -m PyInstaller --noconfirm --clean --onefile --windowed --uac-admin --name StayActive --add-data "STAYACTIVE ICON.png;." --collect-binaries vgamepad --collect-data vgamepad --collect-submodules vgamepad main.py
 ```
 
 Output: `dist/StayActive.exe`
