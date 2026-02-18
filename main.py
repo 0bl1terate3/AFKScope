@@ -8,9 +8,11 @@ import os
 import queue
 import random
 import re
+import shutil
 import struct
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import traceback
@@ -104,7 +106,8 @@ BIOME_ALIAS_MAP: dict[str, str] = {
     "aurora": "AURORA",
 }
 
-APP_VERSION = "0.1.4"
+APP_VERSION = "0.1.5"
+APP_CONFIG_VERSION = 1
 APP_NAME = "StayActive"
 APP_USER_AGENT = f"{APP_NAME}/{APP_VERSION}"
 APP_ICON_ICO = "STAYACTIVE ICON.ico"
@@ -121,6 +124,8 @@ SYNCHRONIZE = 0x00100000
 ERROR_FILE_NOT_FOUND = 2
 ERROR_ACCESS_DENIED = 5
 PROCESS_DUP_HANDLE = 0x0040
+PROCESS_SUSPEND_RESUME = 0x0800
+PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
 DUPLICATE_CLOSE_SOURCE = 0x00000001
 DUPLICATE_SAME_ACCESS = 0x00000002
 TOKEN_QUERY = 0x0008
@@ -174,6 +179,13 @@ class _PROCESSENTRY32W(ctypes.Structure):
     ]
 
 
+class _LASTINPUTINFO(ctypes.Structure):
+    _fields_ = [
+        ("cbSize", wintypes.UINT),
+        ("dwTime", wintypes.DWORD),
+    ]
+
+
 class AntiAfkApp:
     @staticmethod
     def _resource_path(relative_name: str) -> str:
@@ -182,6 +194,43 @@ class AntiAfkApp:
         else:
             base_path = os.path.dirname(os.path.abspath(__file__))
         return os.path.join(base_path, relative_name)
+
+    @staticmethod
+    def _app_data_dir() -> str:
+        local = os.environ.get("LOCALAPPDATA") or os.environ.get("APPDATA")
+        if local:
+            return os.path.join(local, APP_NAME)
+        return os.path.join(os.path.expanduser("~"), f".{APP_NAME.lower()}")
+
+    def _migrate_legacy_runtime_files(self) -> None:
+        legacy_base = os.getcwd()
+        try:
+            if os.path.samefile(legacy_base, self.data_dir):
+                return
+        except Exception:
+            pass
+        os.makedirs(self.data_dir, exist_ok=True)
+        file_names = (
+            "stayactive_config.json",
+            "stayactive_themes.json",
+            "stayactive_recovery_state.json",
+            "stayactive_recovery_snapshot.json",
+        )
+        for name in file_names:
+            src = os.path.join(legacy_base, name)
+            dst = os.path.join(self.data_dir, name)
+            if not os.path.exists(src) or os.path.exists(dst):
+                continue
+            try:
+                shutil.move(src, dst)
+            except Exception as exc:
+                self.startup_warnings.append(f"Startup migration skipped '{name}': {exc}")
+        legacy_presets = os.path.join(legacy_base, "presets")
+        if os.path.isdir(legacy_presets) and not os.path.exists(self.presets_dir):
+            try:
+                shutil.move(legacy_presets, self.presets_dir)
+            except Exception as exc:
+                self.startup_warnings.append(f"Startup migration skipped 'presets': {exc}")
 
     @staticmethod
     def _current_process_pseudo_handle() -> wintypes.HANDLE:
@@ -213,6 +262,7 @@ class AntiAfkApp:
         self.worker_thread: threading.Thread | None = None
         self.stop_event = threading.Event()
         self.metrics_lock = threading.Lock()
+        self.state_lock = threading.RLock()
         self.header_logo_photo: tk.PhotoImage | None = None
         self.header_logo_label: tk.Label | None = None
         self.header_icon_photo: Any | None = None
@@ -222,11 +272,27 @@ class AntiAfkApp:
 
         self.is_running = False
         self.gamepad: Any | None = None
-        self.config_path = os.path.join(os.getcwd(), "stayactive_config.json")
-        self.theme_config_path = os.path.join(os.getcwd(), "stayactive_themes.json")
-        self.recovery_state_path = os.path.join(os.getcwd(), "stayactive_recovery_state.json")
-        self.recovery_snapshot_path = os.path.join(os.getcwd(), "stayactive_recovery_snapshot.json")
-        self.presets_dir = os.path.join(os.getcwd(), "presets")
+        self.startup_warnings: list[str] = []
+        self.nt_suspend_process: Any | None = getattr(self.ntdll, "NtSuspendProcess", None)
+        self.nt_resume_process: Any | None = getattr(self.ntdll, "NtResumeProcess", None)
+        if callable(self.nt_suspend_process):
+            suspend_fn = cast(Any, self.nt_suspend_process)
+            suspend_fn.argtypes = [wintypes.HANDLE]
+            suspend_fn.restype = ctypes.c_long
+        if callable(self.nt_resume_process):
+            resume_fn = cast(Any, self.nt_resume_process)
+            resume_fn.argtypes = [wintypes.HANDLE]
+            resume_fn.restype = ctypes.c_long
+        self.process_limiter_supported = callable(self.nt_suspend_process) and callable(self.nt_resume_process)
+        if not self.process_limiter_supported:
+            self.startup_warnings.append("Process limiter unavailable on this Windows runtime.")
+        self.data_dir = self._app_data_dir()
+        self.config_path = os.path.join(self.data_dir, "stayactive_config.json")
+        self.theme_config_path = os.path.join(self.data_dir, "stayactive_themes.json")
+        self.recovery_state_path = os.path.join(self.data_dir, "stayactive_recovery_state.json")
+        self.recovery_snapshot_path = os.path.join(self.data_dir, "stayactive_recovery_snapshot.json")
+        self.presets_dir = os.path.join(self.data_dir, "presets")
+        self._migrate_legacy_runtime_files()
         self.should_offer_setup_wizard = not os.path.exists(self.config_path)
 
         self.interval_var = tk.StringVar(value="5")
@@ -259,6 +325,12 @@ class AntiAfkApp:
         self.scheduler_slot2_preset_var = tk.StringVar(value="overnight")
         self.update_banner_var = tk.StringVar(value="Checking for updates...")
         self.latest_release_tag_var = tk.StringVar(value="Latest: -")
+        self.process_limiter_enabled_var = tk.BooleanVar(value=False)
+        self.process_limiter_auto_mode_var = tk.BooleanVar(value=False)
+        self.process_limiter_only_when_running_var = tk.BooleanVar(value=True)
+        self.process_limiter_target_percent_var = tk.StringVar(value="40")
+        self.process_limiter_cycle_ms_var = tk.StringVar(value="180")
+        self.process_limiter_status_var = tk.StringVar(value="Limiter idle.")
 
         self.pause_enabled_var = tk.BooleanVar(value=False)
         self.pause_start_var = tk.StringVar(value="02:00")
@@ -266,6 +338,23 @@ class AntiAfkApp:
 
         self.webhook_enabled_var = tk.BooleanVar(value=False)
         self.webhook_url_var = tk.StringVar(value="")
+        self.max_log_lines = 2000
+        self.runtime_watchdog_enabled = True
+        self.runtime_no_window_threshold = 24
+        self.runtime_jump_fail_threshold = 8
+        self.runtime_start_when_windows_found = True
+        self.runtime_recovery_enabled = True
+        self.runtime_jump_mode = "all"
+        self.runtime_safe_mode = False
+        self.runtime_anti_idle_pattern = "balanced"
+        self.runtime_pause_enabled = False
+        self.runtime_pause_start = "02:00"
+        self.runtime_pause_end = "06:00"
+        self.runtime_process_limiter_enabled = False
+        self.runtime_process_limiter_auto_mode = False
+        self.runtime_process_limiter_only_when_running = True
+        self.runtime_process_limiter_target_percent = 40
+        self.runtime_process_limiter_cycle_ms = 180
 
         self.watchdog_enabled_var = tk.BooleanVar(value=True)
         self.watchdog_threshold_var = tk.StringVar(value="12")
@@ -290,10 +379,25 @@ class AntiAfkApp:
         self.instance_fail_count: dict[int, int] = {}
         self.instance_attempt_count: dict[int, int] = {}
         self.instance_quarantine_until: dict[int, float] = {}
+        self.instance_send_fail_streak: dict[int, int] = {}
+        self.instance_recovery_tier_by_hwnd: dict[int, int] = {}
+        self.instance_recovery_last_log_at: dict[int, float] = {}
+        self.instance_recovery_tier1_threshold = 2
+        self.instance_recovery_tier2_threshold = 4
+        self.instance_recovery_tier3_threshold = 6
+        self.instance_recovery_tier1_backoff_seconds = 6
+        self.instance_recovery_tier2_backoff_seconds = 18
+        self.instance_recovery_tier3_backoff_seconds = 90
         self.instance_quarantine_fail_threshold = 6
         self.instance_quarantine_seconds = 180
         self.enabled_by_username: dict[str, bool] = {}
         self.override_by_username: dict[str, dict[str, Any]] = {}
+        self.process_limiter_boost_until_by_pid: dict[int, float] = {}
+        self.process_limiter_suspended_pids: set[int] = set()
+        self.process_limiter_suspend_count = 0
+        self.process_limiter_resume_count = 0
+        self.process_limiter_last_error = ""
+        self.process_limiter_last_error_at = 0.0
 
         self.pid_username: dict[int, str] = {}
         self.pid_user_id: dict[int, int] = {}
@@ -315,6 +419,10 @@ class AntiAfkApp:
 
         self.layout_cache: dict[int, tuple[int, int, int, int, int]] = {}
         self.last_window_count = -1
+        self.last_instance_scan_at = 0.0
+        self.runtime_scan_cache_ttl_seconds = 1.25
+        self.last_health_ui_update_at = 0.0
+        self.health_ui_update_interval_seconds = 1.0
 
         self.session_started_at: float | None = None
         self.session_cycles = 0
@@ -332,18 +440,25 @@ class AntiAfkApp:
         self.waiting_for_windows = False
         self.pause_override_until: float | None = None
         self.last_not_due_log_at = 0.0
+        self.roblox_input_pause_enabled = True
+        self.roblox_input_pause_seconds = 2.0
+        self.roblox_input_pause_until_by_hwnd: dict[int, float] = {}
+        self.roblox_input_pause_logged_hwnds: set[int] = set()
+        self.last_system_input_tick = 0
         self.scheduler_last_applied_key: str | None = None
         self.latest_release_asset_url = ""
         self.latest_release_asset_name = ""
-        self.reports_dir = os.path.join(os.getcwd(), "reports")
+        self.reports_dir = os.path.join(self.data_dir, "reports")
         self.hotkey_help_window: tk.Toplevel | None = None
 
         self.tray_icon = None
         self.tray_enabled = False
         self.hotkey_actions: dict[int, tuple[str, Callable[[], None]]] = {}
         self.global_hotkeys_registered = False
-        self.webhook_queue: queue.Queue[tuple[str, str, int]] = queue.Queue()
+        self.webhook_queue: queue.Queue[tuple[str, str, str, int]] = queue.Queue()
         self.webhook_worker_running = False
+        self.process_limiter_thread: threading.Thread | None = None
+        self.process_limiter_stop_event = threading.Event()
 
         self.current_theme_name = "Midnight"
         self.theme_palettes: dict[str, dict[str, str]] = {
@@ -472,6 +587,11 @@ class AntiAfkApp:
         try:
             runtime_path = sys.executable if getattr(sys, "frozen", False) else os.path.abspath(__file__)
             self.log(f"Runtime binary: {runtime_path}")
+            self._sync_runtime_settings_from_ui()
+            if self.startup_warnings:
+                for warning in self.startup_warnings:
+                    self.log(warning)
+                self.startup_warnings.clear()
             debug_ok = self._ensure_debug_privilege()
             if debug_ok:
                 self.log("SeDebugPrivilege enabled at startup.")
@@ -483,6 +603,7 @@ class AntiAfkApp:
             self.refresh_instance_list(manual=False)
             self.run_diagnostics_checks()
             self._set_global_hotkeys_enabled(self.hotkeys_enabled_var.get(), log_result=False)
+            self._ensure_process_limiter_worker()
             self._schedule_stats_update()
             self._schedule_instance_poll()
             self._schedule_recovery_autosave()
@@ -622,10 +743,12 @@ class AntiAfkApp:
 
         tab_control = ttk.Frame(notebook, padding=10)
         tab_instances = ttk.Frame(notebook, padding=10)
+        tab_performance = ttk.Frame(notebook, padding=10)
         tab_monitor = ttk.Frame(notebook, padding=10)
         tab_log = ttk.Frame(notebook, padding=10)
         notebook.add(tab_control, text="Dashboard")
         notebook.add(tab_instances, text="Instances")
+        notebook.add(tab_performance, text="Performance")
         notebook.add(tab_monitor, text="Health & Diagnostics")
         notebook.add(tab_log, text="Live Log")
 
@@ -966,6 +1089,89 @@ class AntiAfkApp:
         tree_scroll.pack(side=tk.RIGHT, fill="y")
         self.instance_tree.configure(yscrollcommand=tree_scroll.set)
 
+        limiter_group = ttk.LabelFrame(tab_performance, text="Process Limiter", padding=10)
+        limiter_group.pack(fill="x", pady=(0, 8))
+        limiter_row1 = ttk.Frame(limiter_group)
+        limiter_row1.pack(fill="x")
+        ttk.Checkbutton(
+            limiter_row1,
+            text="Enable duty-cycle limiter (suspend/resume Roblox processes)",
+            variable=self.process_limiter_enabled_var,
+        ).pack(side=tk.LEFT)
+        ttk.Checkbutton(
+            limiter_row1,
+            text="Auto mode: force instant 0% freeze",
+            variable=self.process_limiter_auto_mode_var,
+        ).pack(side=tk.LEFT, padx=(12, 0))
+        ttk.Checkbutton(
+            limiter_row1,
+            text="Only while macro is running",
+            variable=self.process_limiter_only_when_running_var,
+        ).pack(side=tk.LEFT, padx=(12, 0))
+
+        limiter_row2 = ttk.Frame(limiter_group)
+        limiter_row2.pack(fill="x", pady=(8, 0))
+        ttk.Label(limiter_row2, text="Target active time (%):").pack(side=tk.LEFT)
+        ttk.Entry(
+            limiter_row2,
+            textvariable=self.process_limiter_target_percent_var,
+            width=5,
+            justify="center",
+        ).pack(side=tk.LEFT, padx=(6, 10))
+        ttk.Label(limiter_row2, text="Cycle (ms):").pack(side=tk.LEFT)
+        ttk.Entry(
+            limiter_row2,
+            textvariable=self.process_limiter_cycle_ms_var,
+            width=6,
+            justify="center",
+        ).pack(side=tk.LEFT, padx=(6, 10))
+        ttk.Button(
+            limiter_row2,
+            text="Apply",
+            width=9,
+            command=self.apply_process_limiter_settings,
+        ).pack(side=tk.LEFT, padx=(0, 6))
+        ttk.Button(
+            limiter_row2,
+            text="Resume All",
+            width=11,
+            command=self.resume_all_limited_processes,
+        ).pack(side=tk.LEFT)
+        ttk.Label(limiter_row2, textvariable=self.process_limiter_status_var).pack(side=tk.RIGHT)
+
+        limiter_note = ttk.LabelFrame(tab_performance, text="Notes", padding=10)
+        limiter_note.pack(fill="x")
+        ttk.Label(
+            limiter_note,
+            text=(
+                "Limiter reduces CPU by cycling Roblox processes between active and suspended windows. "
+                "This build boosts a process before each jump so input remains reliable."
+            ),
+            wraplength=1000,
+            justify=tk.LEFT,
+        ).pack(anchor="w")
+
+        limiter_targets = ttk.LabelFrame(tab_performance, text="Detected Process States", padding=10)
+        limiter_targets.pack(fill="both", expand=True, pady=(8, 0))
+        limiter_tree_frame = ttk.Frame(limiter_targets)
+        limiter_tree_frame.pack(fill="both", expand=True)
+        limiter_columns = ("pid", "username", "state", "boost_until", "title")
+        self.process_limiter_tree = ttk.Treeview(limiter_tree_frame, columns=limiter_columns, show="headings", height=8)
+        self.process_limiter_tree.heading("pid", text="PID")
+        self.process_limiter_tree.heading("username", text="Username")
+        self.process_limiter_tree.heading("state", text="Limiter State")
+        self.process_limiter_tree.heading("boost_until", text="Boost Until")
+        self.process_limiter_tree.heading("title", text="Window Title")
+        self.process_limiter_tree.column("pid", width=80, anchor="center")
+        self.process_limiter_tree.column("username", width=140, anchor="w")
+        self.process_limiter_tree.column("state", width=130, anchor="center")
+        self.process_limiter_tree.column("boost_until", width=120, anchor="center")
+        self.process_limiter_tree.column("title", width=500, anchor="w")
+        self.process_limiter_tree.pack(side=tk.LEFT, fill="both", expand=True)
+        limiter_scroll = ttk.Scrollbar(limiter_tree_frame, orient=tk.VERTICAL, command=self.process_limiter_tree.yview)
+        limiter_scroll.pack(side=tk.RIGHT, fill="y")
+        self.process_limiter_tree.configure(yscrollcommand=limiter_scroll.set)
+
         status_frame = ttk.LabelFrame(tab_monitor, text="Session Stats", padding=10)
         status_frame.pack(fill="x", pady=(8, 0))
         ttk.Label(status_frame, textvariable=self.stats_var).pack(anchor="w")
@@ -1007,16 +1213,27 @@ class AntiAfkApp:
     def _append_log_line(self, line: str) -> None:
         self.log_box.configure(state=tk.NORMAL)
         self.log_box.insert(tk.END, line)
+        line_count = int(self.log_box.index("end-1c").split(".")[0])
+        overflow = line_count - self.max_log_lines
+        if overflow > 0:
+            self.log_box.delete("1.0", f"{overflow + 1}.0")
         self.log_box.see(tk.END)
         self.log_box.configure(state=tk.DISABLED)
+
+    def _enqueue_on_ui_thread(self, callback: Callable[..., None], *args: Any) -> bool:
+        if threading.current_thread() is threading.main_thread():
+            return False
+        try:
+            self.root.after(0, callback, *args)
+        except Exception:
+            return True
+        return True
 
     def log(self, text: str) -> None:
         timestamp = time.strftime("%H:%M:%S")
         line = f"[{timestamp}] {text}\n"
-        if threading.current_thread() is threading.main_thread():
+        if not self._enqueue_on_ui_thread(self._append_log_line, line):
             self._append_log_line(line)
-        else:
-            self.root.after(0, self._append_log_line, line)
 
     def _install_exception_hooks(self) -> None:
         previous_thread_hook = getattr(threading, "excepthook", None)
@@ -1657,6 +1874,8 @@ class AntiAfkApp:
                 self.biome_history_list.insert(tk.END, item)
 
     def _record_event(self, text: str) -> None:
+        if self._enqueue_on_ui_thread(self._record_event, text):
+            return
         stamp = time.strftime("%H:%M:%S")
         line = f"{stamp} | {text}"
         self.event_timeline.append(line)
@@ -1792,12 +2011,17 @@ class AntiAfkApp:
             self._render_biome_badge()
 
     def _send_webhook(self, title: str, description: str) -> None:
+        if self._enqueue_on_ui_thread(self._send_webhook, title, description):
+            return
         if not self.webhook_enabled_var.get():
             return
         url = self.webhook_url_var.get().strip()
         if not url:
             return
-        self.webhook_queue.put((title, description, 0))
+        if not self._is_valid_webhook_url(url):
+            self.log("Webhook skipped: configured URL is invalid.")
+            return
+        self.webhook_queue.put((url, title, description, 0))
         self._ensure_webhook_worker()
 
     def _ensure_webhook_worker(self) -> None:
@@ -1809,15 +2033,12 @@ class AntiAfkApp:
     def _webhook_worker(self) -> None:
         while True:
             try:
-                title, description, attempt = self.webhook_queue.get(timeout=0.4)
+                url, title, description, attempt = self.webhook_queue.get(timeout=0.4)
             except queue.Empty:
-                if not self.webhook_enabled_var.get() or not self.is_running:
-                    self.webhook_worker_running = False
+                self.webhook_worker_running = False
+                if self.webhook_queue.empty():
                     return
-                continue
-
-            url = self.webhook_url_var.get().strip()
-            if not url:
+                self.webhook_worker_running = True
                 continue
 
             payload = {
@@ -1840,11 +2061,13 @@ class AntiAfkApp:
             try:
                 with urlrequest.urlopen(req, timeout=10):
                     pass
-            except Exception:
+            except Exception as exc:
                 if attempt < 3:
                     delay = 2 ** attempt
                     time.sleep(delay)
-                    self.webhook_queue.put((title, description, attempt + 1))
+                    self.webhook_queue.put((url, title, description, attempt + 1))
+                else:
+                    self.log(f"Webhook send failed after retries: {exc}")
 
     def set_running_ui(self, running: bool) -> None:
         self.is_running = running
@@ -1857,6 +2080,166 @@ class AntiAfkApp:
         self.save_button.configure(state=tk.DISABLED if running else tk.NORMAL)
         self.load_button.configure(state=tk.DISABLED if running else tk.NORMAL)
         self.status_var.set("Running" if running else "Idle")
+
+    def apply_process_limiter_settings(self) -> None:
+        try:
+            if self.process_limiter_enabled_var.get():
+                self.parse_process_limiter_cycle_ms()
+                if not self.process_limiter_supported:
+                    raise ValueError("Process limiter is unavailable on this Windows runtime.")
+                if self.process_limiter_auto_mode_var.get():
+                    self.process_limiter_target_percent_var.set("0")
+                    self.process_limiter_only_when_running_var.set(False)
+                else:
+                    self.parse_process_limiter_target_percent()
+        except Exception as exc:
+            messagebox.showerror("Process limiter", str(exc))
+            return
+        self._sync_runtime_settings_from_ui()
+        self._refresh_process_limiter_status()
+        self.log("Process limiter settings applied.")
+
+    def resume_all_limited_processes(self) -> None:
+        resumed = self._process_limiter_resume_all(log_result=False)
+        self.log(f"Process limiter resumed {resumed} suspended process(es).")
+        self._refresh_process_limiter_status()
+
+    def _refresh_process_limiter_tree(self) -> None:
+        if not hasattr(self, "process_limiter_tree"):
+            return
+        with self.state_lock:
+            windows = list(self.window_map)
+            usernames = dict(self.pid_username)
+            suspended = set(self.process_limiter_suspended_pids)
+            boost_until = dict(self.process_limiter_boost_until_by_pid)
+        now = time.time()
+        rows: dict[int, tuple[str, str, str, str, str]] = {}
+        for _hwnd, title, pid, _pname in windows:
+            username = usernames.get(pid, "Unknown")
+            state = "Suspended" if pid in suspended else "Active"
+            boosted = boost_until.get(pid, 0.0)
+            if boosted > now and state != "Suspended":
+                state = "Boosted"
+            boost_text = time.strftime("%H:%M:%S", time.localtime(boosted)) if boosted > now else "-"
+            rows[pid] = (str(pid), username, state, boost_text, title[:120])
+
+        tree = self.process_limiter_tree
+        for item in tree.get_children():
+            tree.delete(item)
+        for pid in sorted(rows):
+            tree.insert("", tk.END, values=rows[pid])
+
+    def _refresh_process_limiter_status(self) -> None:
+        with self.state_lock:
+            total = len({pid for _hwnd, _title, pid, _pname in self.window_map})
+            suspended = len(self.process_limiter_suspended_pids)
+            enabled = self.runtime_process_limiter_enabled
+            auto_mode = self.runtime_process_limiter_auto_mode
+            only_running = self.runtime_process_limiter_only_when_running
+            percent = self.runtime_process_limiter_target_percent
+            cycle_ms = self.runtime_process_limiter_cycle_ms
+            errors = self.process_limiter_last_error
+            supports = self.process_limiter_supported
+        if not supports:
+            text = "Limiter unavailable on this runtime."
+        elif not enabled:
+            text = f"Limiter off | targets {total} | suspended {suspended}"
+        else:
+            scope = "run-only" if only_running else "always"
+            if auto_mode:
+                text = f"Limiter on (AUTO 0% freeze, {scope}) | targets {total} | suspended {suspended}"
+            elif percent <= 0:
+                text = f"Limiter on (0% freeze, {scope}) | targets {total} | suspended {suspended}"
+            else:
+                text = f"Limiter on ({percent}%/{cycle_ms}ms, {scope}) | targets {total} | suspended {suspended}"
+            if errors:
+                text += f" | last error: {errors[:80]}"
+        self.process_limiter_status_var.set(text)
+        self._refresh_process_limiter_tree()
+
+    def _process_limiter_mark_error(self, message: str) -> None:
+        now = time.time()
+        should_log = False
+        with self.state_lock:
+            self.process_limiter_last_error = message
+            if (now - self.process_limiter_last_error_at) >= 20:
+                self.process_limiter_last_error_at = now
+                should_log = True
+        if should_log:
+            self.log(f"Process limiter: {message}")
+
+    def _process_limiter_target_pids_snapshot(self) -> set[int]:
+        with self.state_lock:
+            window_pids = {pid for _hwnd, _title, pid, _pname in self.window_map if pid > 0 and pid != os.getpid()}
+        process_pids = {pid for pid in self._all_roblox_process_pids() if pid > 0 and pid != os.getpid()}
+        if process_pids:
+            return process_pids | window_pids
+        return window_pids
+
+    def _process_limiter_should_throttle(self) -> bool:
+        if not self.runtime_process_limiter_enabled or not self.process_limiter_supported:
+            return False
+        if self.runtime_process_limiter_only_when_running and not self.is_running:
+            return False
+        return True
+
+    def parse_process_limiter_target_percent(self) -> int:
+        raw = self.process_limiter_target_percent_var.get().strip()
+        try:
+            value = int(raw)
+        except ValueError as exc:
+            raise ValueError("Process limiter target percent must be an integer.") from exc
+        if value < 0 or value > 100:
+            raise ValueError("Process limiter target percent must be between 0 and 100.")
+        return value
+
+    def parse_process_limiter_cycle_ms(self) -> int:
+        raw = self.process_limiter_cycle_ms_var.get().strip()
+        try:
+            value = int(raw)
+        except ValueError as exc:
+            raise ValueError("Process limiter cycle must be an integer (ms).") from exc
+        if value < 80 or value > 2000:
+            raise ValueError("Process limiter cycle must be between 80 and 2000 ms.")
+        return value
+
+    def _sync_runtime_settings_from_ui(self) -> None:
+        self.runtime_watchdog_enabled = bool(self.watchdog_enabled_var.get())
+        if self.runtime_watchdog_enabled:
+            try:
+                self.runtime_no_window_threshold = self.parse_no_windows_watchdog_threshold()
+            except Exception:
+                pass
+            try:
+                self.runtime_jump_fail_threshold = self.parse_jump_fail_watchdog_threshold()
+            except Exception:
+                pass
+        self.runtime_start_when_windows_found = bool(self.start_when_windows_found_var.get())
+        self.runtime_recovery_enabled = bool(self.recovery_enabled_var.get())
+        jump_mode = self.jump_mode_var.get().strip().lower()
+        self.runtime_jump_mode = jump_mode if jump_mode in {"all", "round", "weighted"} else "all"
+        self.runtime_safe_mode = bool(self.safe_mode_var.get())
+        anti_pattern = self.anti_idle_pattern_var.get().strip().lower()
+        self.runtime_anti_idle_pattern = (
+            anti_pattern if anti_pattern in {"balanced", "subtle", "aggressive", "randomized"} else "balanced"
+        )
+        self.runtime_pause_enabled = bool(self.pause_enabled_var.get())
+        self.runtime_pause_start = self.pause_start_var.get().strip()
+        self.runtime_pause_end = self.pause_end_var.get().strip()
+        self.runtime_process_limiter_enabled = bool(self.process_limiter_enabled_var.get()) and self.process_limiter_supported
+        self.runtime_process_limiter_auto_mode = bool(self.process_limiter_auto_mode_var.get())
+        self.runtime_process_limiter_only_when_running = bool(self.process_limiter_only_when_running_var.get())
+        try:
+            self.runtime_process_limiter_target_percent = self.parse_process_limiter_target_percent()
+        except Exception:
+            pass
+        try:
+            self.runtime_process_limiter_cycle_ms = self.parse_process_limiter_cycle_ms()
+        except Exception:
+            pass
+        if self.runtime_process_limiter_auto_mode:
+            self.runtime_process_limiter_only_when_running = False
+            self.runtime_process_limiter_target_percent = 0
 
     def parse_interval(self) -> float:
         raw = self.interval_var.get().strip()
@@ -1967,6 +2350,12 @@ class AntiAfkApp:
                 raise ValueError("Webhook is enabled but URL is empty.")
             if not self._is_valid_webhook_url(url):
                 raise ValueError("Webhook URL must be a valid HTTPS URL.")
+        if self.process_limiter_enabled_var.get():
+            if not self.process_limiter_supported:
+                raise ValueError("Process limiter is enabled, but suspend/resume APIs are unavailable.")
+            self.parse_process_limiter_cycle_ms()
+            if not self.process_limiter_auto_mode_var.get():
+                self.parse_process_limiter_target_percent()
 
     def _detect_unclean_shutdown(self) -> bool:
         if not os.path.exists(self.recovery_state_path):
@@ -3154,10 +3543,11 @@ class AntiAfkApp:
             return None
 
     def _start_identity_lookup(self, pid: int) -> None:
-        if pid in self.identity_lookup_inflight:
-            return
-        self.identity_lookup_inflight.add(pid)
-        self.identity_last_attempt[pid] = time.time()
+        with self.state_lock:
+            if pid in self.identity_lookup_inflight:
+                return
+            self.identity_lookup_inflight.add(pid)
+            self.identity_last_attempt[pid] = time.time()
         threading.Thread(target=self._identity_lookup_worker, args=(pid,), daemon=True).start()
 
     def _identity_lookup_worker(self, pid: int) -> None:
@@ -3175,24 +3565,25 @@ class AntiAfkApp:
         confidence: str,
         avatar_bytes: bytes | None,
     ) -> None:
-        self.identity_lookup_inflight.discard(pid)
-        if username:
-            self.pid_username[pid] = username
-            self.enabled_by_username.setdefault(username.lower(), True)
-            cached = self.override_by_username.get(username.lower())
-            if isinstance(cached, dict):
-                cached_interval = cached.get("interval")
-                if isinstance(cached_interval, (float, int)) and cached_interval > 0:
-                    self.instance_interval_override[pid] = float(cached_interval)
-                cached_pattern = cached.get("pattern")
-                if isinstance(cached_pattern, str) and cached_pattern in {"balanced", "subtle", "aggressive", "randomized"}:
-                    self.instance_pattern_override[pid] = cached_pattern
-                cached_priority = cached.get("priority")
-                if isinstance(cached_priority, int) and 1 <= cached_priority <= 9:
-                    self.instance_priority_by_pid[pid] = cached_priority
-        self.pid_identity_confidence[pid] = confidence
-        if user_id is not None:
-            self.pid_user_id[pid] = user_id
+        with self.state_lock:
+            self.identity_lookup_inflight.discard(pid)
+            if username:
+                self.pid_username[pid] = username
+                self.enabled_by_username.setdefault(username.lower(), True)
+                cached = self.override_by_username.get(username.lower())
+                if isinstance(cached, dict):
+                    cached_interval = cached.get("interval")
+                    if isinstance(cached_interval, (float, int)) and cached_interval > 0:
+                        self.instance_interval_override[pid] = float(cached_interval)
+                    cached_pattern = cached.get("pattern")
+                    if isinstance(cached_pattern, str) and cached_pattern in {"balanced", "subtle", "aggressive", "randomized"}:
+                        self.instance_pattern_override[pid] = cached_pattern
+                    cached_priority = cached.get("priority")
+                    if isinstance(cached_priority, int) and 1 <= cached_priority <= 9:
+                        self.instance_priority_by_pid[pid] = cached_priority
+            self.pid_identity_confidence[pid] = confidence
+            if user_id is not None:
+                self.pid_user_id[pid] = user_id
         if avatar_bytes:
             try:
                 encoded = base64.b64encode(avatar_bytes).decode("ascii")
@@ -3200,57 +3591,87 @@ class AntiAfkApp:
                 if image.width() > 32:
                     step = max(1, (image.width() + 31) // 32)
                     image = cast(tk.PhotoImage, image.subsample(step))
-                self.pid_avatar_photo[pid] = image
+                with self.state_lock:
+                    self.pid_avatar_photo[pid] = image
             except tk.TclError:
                 pass
         self.refresh_instance_list(manual=False)
 
     def refresh_instance_list(self, manual: bool) -> None:
-        previous_count = len(self.window_map)
-        old_map = {hwnd: (title, pid, pname) for hwnd, title, pid, pname in self.window_map}
-        self.window_map = self.find_roblox_windows()
+        if self._enqueue_on_ui_thread(self.refresh_instance_list, manual):
+            return
+        scanned_windows = self.find_roblox_windows()
+        with self.state_lock:
+            previous_count = len(self.window_map)
+            old_map = {hwnd: (title, pid, pname) for hwnd, title, pid, pname in self.window_map}
+            self.window_map = scanned_windows
+            self.last_instance_scan_at = time.time()
 
-        for old_hwnd, (_title, old_pid, _pname) in old_map.items():
-            username = self.pid_username.get(old_pid)
-            if username:
-                uname = username.lower()
-                self.enabled_by_username[uname] = self.instance_enabled_by_hwnd.get(old_hwnd, True)
-                self.override_by_username[uname] = {
-                    "interval": self.instance_interval_override.get(old_pid),
-                    "pattern": self.instance_pattern_override.get(old_pid),
-                    "priority": self.instance_priority_by_pid.get(old_pid, 1),
-                }
+            for old_hwnd, (_title, old_pid, _pname) in old_map.items():
+                username = self.pid_username.get(old_pid)
+                if username:
+                    uname = username.lower()
+                    self.enabled_by_username[uname] = self.instance_enabled_by_hwnd.get(old_hwnd, True)
+                    self.override_by_username[uname] = {
+                        "interval": self.instance_interval_override.get(old_pid),
+                        "pattern": self.instance_pattern_override.get(old_pid),
+                        "priority": self.instance_priority_by_pid.get(old_pid, 1),
+                    }
 
-        active_hwnds = {hwnd for hwnd, _, _, _ in self.window_map}
-        active_pids = {pid for _hwnd, _title, pid, _pname in self.window_map}
-        self.instance_enabled_by_hwnd = {hwnd: enabled for hwnd, enabled in self.instance_enabled_by_hwnd.items() if hwnd in active_hwnds}
-        self.instance_last_jump = {hwnd: ts for hwnd, ts in self.instance_last_jump.items() if hwnd in active_hwnds}
-        self.pid_log_hint = {pid: path for pid, path in self.pid_log_hint.items() if pid in active_pids}
+            active_hwnds = {hwnd for hwnd, _, _, _ in self.window_map}
+            active_pids = {pid for _hwnd, _title, pid, _pname in self.window_map}
+            self.instance_enabled_by_hwnd = {
+                hwnd: enabled for hwnd, enabled in self.instance_enabled_by_hwnd.items() if hwnd in active_hwnds
+            }
+            self.instance_last_jump = {hwnd: ts for hwnd, ts in self.instance_last_jump.items() if hwnd in active_hwnds}
+            self.instance_send_fail_streak = {
+                hwnd: count for hwnd, count in self.instance_send_fail_streak.items() if hwnd in active_hwnds
+            }
+            self.instance_recovery_tier_by_hwnd = {
+                hwnd: tier for hwnd, tier in self.instance_recovery_tier_by_hwnd.items() if hwnd in active_hwnds
+            }
+            self.instance_recovery_last_log_at = {
+                hwnd: ts for hwnd, ts in self.instance_recovery_last_log_at.items() if hwnd in active_hwnds
+            }
+            now = time.time()
+            self.roblox_input_pause_until_by_hwnd = {
+                hwnd: ts for hwnd, ts in self.roblox_input_pause_until_by_hwnd.items() if hwnd in active_hwnds and ts > now
+            }
+            self.roblox_input_pause_logged_hwnds = {
+                hwnd for hwnd in self.roblox_input_pause_logged_hwnds if hwnd in self.roblox_input_pause_until_by_hwnd
+            }
+            self.pid_log_hint = {pid: path for pid, path in self.pid_log_hint.items() if pid in active_pids}
+            self.process_limiter_boost_until_by_pid = {
+                pid: ts
+                for pid, ts in self.process_limiter_boost_until_by_pid.items()
+                if pid in active_pids and ts > now
+            }
 
-        for hwnd, _title, pid, _pname in self.window_map:
-            if hwnd not in self.instance_enabled_by_hwnd:
+            for hwnd, _title, pid, _pname in self.window_map:
+                if hwnd not in self.instance_enabled_by_hwnd:
+                    username = self.pid_username.get(pid, "").lower()
+                    if username and username in self.enabled_by_username:
+                        self.instance_enabled_by_hwnd[hwnd] = self.enabled_by_username[username]
+                    else:
+                        self.instance_enabled_by_hwnd[hwnd] = self.loaded_enabled_by_pid.get(pid, True)
                 username = self.pid_username.get(pid, "").lower()
-                if username and username in self.enabled_by_username:
-                    self.instance_enabled_by_hwnd[hwnd] = self.enabled_by_username[username]
-                else:
-                    self.instance_enabled_by_hwnd[hwnd] = self.loaded_enabled_by_pid.get(pid, True)
-            username = self.pid_username.get(pid, "").lower()
-            if username and username in self.override_by_username:
-                cached = self.override_by_username[username]
-                cached_interval = cached.get("interval")
-                if isinstance(cached_interval, (float, int)) and cached_interval > 0:
-                    self.instance_interval_override[pid] = float(cached_interval)
-                cached_pattern = cached.get("pattern")
-                if isinstance(cached_pattern, str) and cached_pattern in {"balanced", "subtle", "aggressive", "randomized"}:
-                    self.instance_pattern_override[pid] = cached_pattern
-                cached_priority = cached.get("priority")
-                if isinstance(cached_priority, int) and 1 <= cached_priority <= 9:
-                    self.instance_priority_by_pid[pid] = cached_priority
+                if username and username in self.override_by_username:
+                    cached = self.override_by_username[username]
+                    cached_interval = cached.get("interval")
+                    if isinstance(cached_interval, (float, int)) and cached_interval > 0:
+                        self.instance_interval_override[pid] = float(cached_interval)
+                    cached_pattern = cached.get("pattern")
+                    if isinstance(cached_pattern, str) and cached_pattern in {"balanced", "subtle", "aggressive", "randomized"}:
+                        self.instance_pattern_override[pid] = cached_pattern
+                    cached_priority = cached.get("priority")
+                    if isinstance(cached_priority, int) and 1 <= cached_priority <= 9:
+                        self.instance_priority_by_pid[pid] = cached_priority
 
+            window_snapshot = list(self.window_map)
         for item in self.instance_tree.get_children():
             self.instance_tree.delete(item)
 
-        for hwnd, title, pid, pname in sorted(self.window_map, key=lambda x: x[2]):
+        for hwnd, title, pid, pname in sorted(window_snapshot, key=lambda x: x[2]):
             enabled = self.instance_enabled_by_hwnd.get(hwnd, True)
             username = self.pid_username.get(pid)
             if not username:
@@ -3275,7 +3696,7 @@ class AntiAfkApp:
             self.instance_tree.item(item_id, values=list(values))
 
         now = time.time()
-        pids = {pid for _hwnd, _title, pid, _pname in self.window_map}
+        pids = {pid for _hwnd, _title, pid, _pname in window_snapshot}
         for pid in pids:
             if pid in self.pid_username:
                 continue
@@ -3284,51 +3705,69 @@ class AntiAfkApp:
             if now - self.identity_last_attempt.get(pid, 0) >= 20:
                 self._start_identity_lookup(pid)
 
-        if len(self.window_map) != self.last_window_count:
-            self.last_window_count = len(self.window_map)
-            self.log(f"Detected Roblox windows: {len(self.window_map)}")
+        if len(window_snapshot) != self.last_window_count:
+            self.last_window_count = len(window_snapshot)
+            self.log(f"Detected Roblox windows: {len(window_snapshot)}")
 
-        if self.auto_realign_var.get() and len(self.window_map) > 0 and len(self.window_map) != previous_count:
+        if self.auto_realign_var.get() and len(window_snapshot) > 0 and len(window_snapshot) != previous_count:
             self.align_windows(log_result=False)
             self.log("Auto-realigned windows after instance count change.")
 
         self.update_health_panel()
+        self._refresh_process_limiter_status()
         if manual:
             self.log("Instance list refreshed.")
 
     def update_health_panel(self) -> None:
+        with self.state_lock:
+            window_snapshot = list(self.window_map)
+            enabled_by_hwnd = dict(self.instance_enabled_by_hwnd)
+            username_by_pid = dict(self.pid_username)
+            confidence_by_pid = dict(self.pid_identity_confidence)
+            last_jump_by_hwnd = dict(self.instance_last_jump)
+            attempt_by_hwnd = dict(self.instance_attempt_count)
+            fail_by_hwnd = dict(self.instance_fail_count)
+            send_fail_streak_by_hwnd = dict(self.instance_send_fail_streak)
+            recovery_tier_by_hwnd = dict(self.instance_recovery_tier_by_hwnd)
+            priority_by_pid = dict(self.instance_priority_by_pid)
+            quarantine_until_by_hwnd = dict(self.instance_quarantine_until)
         lines: list[str] = []
         biome_seen = "-"
         if self.current_biome_seen_at is not None:
             biome_seen = time.strftime("%H:%M:%S", time.localtime(self.current_biome_seen_at))
         lines.append(f"Biome {self.current_biome_name} | source {self.current_biome_source} | seen {biome_seen}")
-        if not self.window_map:
+        if not window_snapshot:
             lines.append("No Roblox instances detected.")
         else:
             enabled_count = 0
-            for hwnd, title, pid, _pname in self.window_map:
-                enabled = self.instance_enabled_by_hwnd.get(hwnd, True)
+            for hwnd, title, pid, _pname in window_snapshot:
+                enabled = enabled_by_hwnd.get(hwnd, True)
                 if enabled:
                     enabled_count += 1
-                username = self.pid_username.get(pid, "unknown")
-                confidence = self.pid_identity_confidence.get(pid, "unknown")
-                last_jump = self.instance_last_jump.get(hwnd)
+                username = username_by_pid.get(pid, "unknown")
+                confidence = confidence_by_pid.get(pid, "unknown")
+                last_jump = last_jump_by_hwnd.get(hwnd)
                 last_jump_str = time.strftime("%H:%M:%S", time.localtime(last_jump)) if last_jump else "never"
                 age_str = "-"
                 if last_jump is not None:
                     age = int(max(0, time.time() - last_jump))
                     age_str = f"{age}s"
-                attempts = self.instance_attempt_count.get(hwnd, 0)
-                fails = self.instance_fail_count.get(hwnd, 0)
-                priority = self.instance_priority_by_pid.get(pid, 1)
+                attempts = attempt_by_hwnd.get(hwnd, 0)
+                fails = fail_by_hwnd.get(hwnd, 0)
+                send_fail_streak = send_fail_streak_by_hwnd.get(hwnd, 0)
+                recovery_tier = recovery_tier_by_hwnd.get(hwnd, 0)
+                priority = priority_by_pid.get(pid, 1)
                 reliability = "n/a" if attempts == 0 else f"{max(0.0, (attempts - fails) * 100 / attempts):.0f}%"
-                quarantine_left = max(0, int(self.instance_quarantine_until.get(hwnd, 0.0) - time.time()))
+                quarantine_left = max(0, int(quarantine_until_by_hwnd.get(hwnd, 0.0) - time.time()))
                 quarantine_text = f" | quarantine {quarantine_left}s" if quarantine_left > 0 else ""
+                recovery_text = ""
+                if send_fail_streak > 0:
+                    recovery_text = f" | recovery t{recovery_tier} streak {send_fail_streak}"
                 status = "ENABLED" if enabled else "DISABLED"
                 lines.append(
-                    f"PID {pid} | prio {priority} | {username} ({confidence}) | HWND {hwnd} | {status} | last jump {last_jump_str} ({age_str}) | reliability {reliability}{quarantine_text} | {title[:20]}"
+                    f"PID {pid} | prio {priority} | {username} ({confidence}) | HWND {hwnd} | {status} | last jump {last_jump_str} ({age_str}) | reliability {reliability}{quarantine_text}{recovery_text} | {title[:20]}"
                 )
-            lines.insert(1, f"Enabled {enabled_count}/{len(self.window_map)} instances")
+            lines.insert(1, f"Enabled {enabled_count}/{len(window_snapshot)} instances")
 
         self.health_text.configure(state=tk.NORMAL)
         self.health_text.delete("1.0", tk.END)
@@ -3336,14 +3775,15 @@ class AntiAfkApp:
         self.health_text.configure(state=tk.DISABLED)
 
     def _toggle_hwnd_enabled(self, hwnd: int) -> None:
-        if hwnd not in self.instance_enabled_by_hwnd:
-            return
-        self.instance_enabled_by_hwnd[hwnd] = not self.instance_enabled_by_hwnd[hwnd]
-        pid = next((pid for h, _t, pid, _p in self.window_map if h == hwnd), None)
-        if pid is not None:
-            username = self.pid_username.get(pid)
-            if username:
-                self.enabled_by_username[username.lower()] = self.instance_enabled_by_hwnd[hwnd]
+        with self.state_lock:
+            if hwnd not in self.instance_enabled_by_hwnd:
+                return
+            self.instance_enabled_by_hwnd[hwnd] = not self.instance_enabled_by_hwnd[hwnd]
+            pid = next((pid for h, _t, pid, _p in self.window_map if h == hwnd), None)
+            if pid is not None:
+                username = self.pid_username.get(pid)
+                if username:
+                    self.enabled_by_username[username.lower()] = self.instance_enabled_by_hwnd[hwnd]
         self.refresh_instance_list(manual=False)
 
     def on_tree_double_click(self, event: tk.Event) -> None:
@@ -3367,32 +3807,36 @@ class AntiAfkApp:
                 hwnd = int(item)
             except ValueError:
                 continue
-            pid = next((pid for h, _t, pid, _p in self.window_map if h == hwnd), None)
+            with self.state_lock:
+                pid = next((pid for h, _t, pid, _p in self.window_map if h == hwnd), None)
             if pid is None:
                 continue
-            self.pid_username.pop(pid, None)
-            self.pid_user_id.pop(pid, None)
-            self.pid_avatar_photo.pop(pid, None)
-            self.pid_identity_confidence.pop(pid, None)
-            self.identity_last_attempt[pid] = 0
+            with self.state_lock:
+                self.pid_username.pop(pid, None)
+                self.pid_user_id.pop(pid, None)
+                self.pid_avatar_photo.pop(pid, None)
+                self.pid_identity_confidence.pop(pid, None)
+                self.identity_last_attempt[pid] = 0
             self._start_identity_lookup(pid)
         self.log("Requested identity retry for selected instances.")
 
     def enable_all_instances(self) -> None:
-        for hwnd, _title, pid, _pname in self.window_map:
-            self.instance_enabled_by_hwnd[hwnd] = True
-            username = self.pid_username.get(pid)
-            if username:
-                self.enabled_by_username[username.lower()] = True
+        with self.state_lock:
+            for hwnd, _title, pid, _pname in self.window_map:
+                self.instance_enabled_by_hwnd[hwnd] = True
+                username = self.pid_username.get(pid)
+                if username:
+                    self.enabled_by_username[username.lower()] = True
         self.refresh_instance_list(manual=False)
         self.log("Enabled all detected instances.")
 
     def disable_all_instances(self) -> None:
-        for hwnd, _title, pid, _pname in self.window_map:
-            self.instance_enabled_by_hwnd[hwnd] = False
-            username = self.pid_username.get(pid)
-            if username:
-                self.enabled_by_username[username.lower()] = False
+        with self.state_lock:
+            for hwnd, _title, pid, _pname in self.window_map:
+                self.instance_enabled_by_hwnd[hwnd] = False
+                username = self.pid_username.get(pid)
+                if username:
+                    self.enabled_by_username[username.lower()] = False
         self.refresh_instance_list(manual=False)
         self.log("Disabled all detected instances.")
 
@@ -3429,18 +3873,20 @@ class AntiAfkApp:
                 hwnd = int(item)
             except ValueError:
                 continue
-            pid = next((pid for h, _t, pid, _p in self.window_map if h == hwnd), None)
+            with self.state_lock:
+                pid = next((pid for h, _t, pid, _p in self.window_map if h == hwnd), None)
             if pid is None:
                 continue
-            if interval_override is None:
-                self.instance_interval_override.pop(pid, None)
-            else:
-                self.instance_interval_override[pid] = interval_override
-            if raw_pattern == "default":
-                self.instance_pattern_override.pop(pid, None)
-            else:
-                self.instance_pattern_override[pid] = raw_pattern
-            self.instance_priority_by_pid[pid] = priority_value
+            with self.state_lock:
+                if interval_override is None:
+                    self.instance_interval_override.pop(pid, None)
+                else:
+                    self.instance_interval_override[pid] = interval_override
+                if raw_pattern == "default":
+                    self.instance_pattern_override.pop(pid, None)
+                else:
+                    self.instance_pattern_override[pid] = raw_pattern
+                self.instance_priority_by_pid[pid] = priority_value
             applied += 1
         if applied > 0:
             self.log(f"Applied per-instance overrides to {applied} instance(s).")
@@ -3457,12 +3903,14 @@ class AntiAfkApp:
                 hwnd = int(item)
             except ValueError:
                 continue
-            pid = next((pid for h, _t, pid, _p in self.window_map if h == hwnd), None)
+            with self.state_lock:
+                pid = next((pid for h, _t, pid, _p in self.window_map if h == hwnd), None)
             if pid is None:
                 continue
-            self.instance_interval_override.pop(pid, None)
-            self.instance_pattern_override.pop(pid, None)
-            self.instance_priority_by_pid.pop(pid, None)
+            with self.state_lock:
+                self.instance_interval_override.pop(pid, None)
+                self.instance_pattern_override.pop(pid, None)
+                self.instance_priority_by_pid.pop(pid, None)
             cleared += 1
         if cleared > 0:
             self.log(f"Cleared per-instance overrides for {cleared} instance(s).")
@@ -3604,11 +4052,11 @@ class AntiAfkApp:
             if time.time() < self.pause_override_until:
                 return True
             self.pause_override_until = None
-        if not self.pause_enabled_var.get():
+        if not self.runtime_pause_enabled:
             return False
         try:
-            start_hour, start_min = self._parse_hhmm(self.pause_start_var.get(), "Pause start")
-            end_hour, end_min = self._parse_hhmm(self.pause_end_var.get(), "Pause end")
+            start_hour, start_min = self._parse_hhmm(self.runtime_pause_start, "Pause start")
+            end_hour, end_min = self._parse_hhmm(self.runtime_pause_end, "Pause end")
         except Exception:
             return False
 
@@ -3672,6 +4120,18 @@ class AntiAfkApp:
                 warnings.append("No-windows watchdog under 5 cycles may spam refresh/recovery.")
         except Exception:
             pass
+        if self.process_limiter_enabled_var.get():
+            try:
+                if self.process_limiter_auto_mode_var.get():
+                    warnings.append("Process limiter auto mode forces immediate 0% freeze on Roblox processes.")
+                else:
+                    limiter_percent = self.parse_process_limiter_target_percent()
+                    if limiter_percent == 0:
+                        warnings.append("Process limiter at 0% fully freezes Roblox processes and blocks anti-AFK input.")
+                    elif limiter_percent < 20:
+                        warnings.append("Process limiter under 20% active time can cause delayed in-game reactions.")
+            except Exception:
+                pass
         if self.webhook_enabled_var.get() and not self.webhook_url_var.get().strip():
             warnings.append("Webhook is enabled but URL is empty.")
         return warnings
@@ -3693,16 +4153,262 @@ class AntiAfkApp:
         self.log("Manual pause cleared.")
         self._record_event("Manual pause cleared")
 
+    def _current_input_tick(self) -> int:
+        info = _LASTINPUTINFO()
+        info.cbSize = ctypes.sizeof(_LASTINPUTINFO)
+        if not self.user32.GetLastInputInfo(ctypes.byref(info)):
+            return self.last_system_input_tick
+        return int(info.dwTime)
+
+    def _is_roblox_hwnd(self, hwnd: int) -> bool:
+        if hwnd <= 0 or not self.user32.IsWindow(hwnd):
+            return False
+        with self.state_lock:
+            for known_hwnd, _title, _pid, _pname in self.window_map:
+                if known_hwnd == hwnd:
+                    return True
+        pid_ref = wintypes.DWORD(0)
+        self.user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid_ref))
+        pid = int(pid_ref.value)
+        if pid <= 0:
+            return False
+        pname = self._get_process_name(pid).lower()
+        return pname in {"robloxplayerbeta.exe", "windows10universal.exe"}
+
+    def _release_virtual_inputs(self) -> None:
+        if self.gamepad is None:
+            return
+        try:
+            vg_module = cast(Any, self._ensure_vgamepad_module())
+            jump_button = vg_module.XUSB_BUTTON.XUSB_GAMEPAD_A
+            self.gamepad.left_joystick(0, 0)
+            self.gamepad.release_button(jump_button)
+            self.gamepad.update()
+        except Exception:
+            pass
+
+    def _is_window_input_paused(self, hwnd: int, now: float | None = None) -> bool:
+        if now is None:
+            now = time.time()
+        with self.state_lock:
+            until = self.roblox_input_pause_until_by_hwnd.get(hwnd, 0.0)
+            if until > now:
+                return True
+            if hwnd in self.roblox_input_pause_until_by_hwnd:
+                self.roblox_input_pause_until_by_hwnd.pop(hwnd, None)
+                if hwnd in self.roblox_input_pause_logged_hwnds:
+                    self.roblox_input_pause_logged_hwnds.discard(hwnd)
+                    self.log(f"Auto-pause ended for Roblox window {hwnd}.")
+        return False
+
+    def _update_roblox_input_pause(self) -> None:
+        if not self.roblox_input_pause_enabled or not self.is_running:
+            return
+        tick = self._current_input_tick()
+        if tick == self.last_system_input_tick:
+            return
+        self.last_system_input_tick = tick
+        hwnd = int(self.user32.GetForegroundWindow() or 0)
+        if not self._is_roblox_hwnd(hwnd):
+            return
+        now = time.time()
+        pause_for = max(0.2, min(self.roblox_input_pause_seconds, 10.0))
+        with self.state_lock:
+            self.roblox_input_pause_until_by_hwnd[hwnd] = now + pause_for
+            if hwnd not in self.roblox_input_pause_logged_hwnds:
+                self.roblox_input_pause_logged_hwnds.add(hwnd)
+                self.log(f"Auto-paused anti-AFK for Roblox window {hwnd}: active user input.")
+        self._release_virtual_inputs()
+
+    def _process_limiter_open_process(self, pid: int) -> int | None:
+        if pid <= 0 or pid == os.getpid():
+            return None
+        rights = PROCESS_SUSPEND_RESUME | PROCESS_QUERY_LIMITED_INFORMATION
+        handle = int(self.kernel32.OpenProcess(rights, False, pid))
+        if handle <= 0:
+            return None
+        return handle
+
+    def _process_limiter_suspend_pid(self, pid: int) -> bool:
+        if not self.process_limiter_supported:
+            return False
+        suspend_fn = self.nt_suspend_process
+        if suspend_fn is None:
+            return False
+        handle = self._process_limiter_open_process(pid)
+        if handle is None:
+            return False
+        status = STATUS_INFO_LENGTH_MISMATCH
+        try:
+            status = int(cast(Any, suspend_fn)(wintypes.HANDLE(handle)))
+        except Exception as exc:
+            self._process_limiter_mark_error(f"suspend failed for PID {pid}: {exc}")
+            return False
+        finally:
+            self.kernel32.CloseHandle(wintypes.HANDLE(handle))
+        if self._ntstatus_unsigned(status) == STATUS_SUCCESS:
+            return True
+        self._process_limiter_mark_error(f"suspend NTSTATUS 0x{self._ntstatus_unsigned(status):08X} for PID {pid}")
+        return False
+
+    def _process_limiter_resume_pid(self, pid: int) -> bool:
+        if not self.process_limiter_supported:
+            return False
+        resume_fn = self.nt_resume_process
+        if resume_fn is None:
+            return False
+        handle = self._process_limiter_open_process(pid)
+        if handle is None:
+            return False
+        status = STATUS_INFO_LENGTH_MISMATCH
+        try:
+            status = int(cast(Any, resume_fn)(wintypes.HANDLE(handle)))
+        except Exception as exc:
+            self._process_limiter_mark_error(f"resume failed for PID {pid}: {exc}")
+            return False
+        finally:
+            self.kernel32.CloseHandle(wintypes.HANDLE(handle))
+        if self._ntstatus_unsigned(status) == STATUS_SUCCESS:
+            return True
+        self._process_limiter_mark_error(f"resume NTSTATUS 0x{self._ntstatus_unsigned(status):08X} for PID {pid}")
+        return False
+
+    def _process_limiter_suspend_many(self, pids: set[int]) -> None:
+        for pid in sorted(pids):
+            with self.state_lock:
+                if pid in self.process_limiter_suspended_pids:
+                    continue
+            if self._process_limiter_suspend_pid(pid):
+                with self.state_lock:
+                    self.process_limiter_suspended_pids.add(pid)
+                    self.process_limiter_suspend_count += 1
+
+    def _process_limiter_resume_many(self, pids: set[int], force: bool = False) -> int:
+        resumed = 0
+        for pid in sorted(pids):
+            with self.state_lock:
+                was_suspended = pid in self.process_limiter_suspended_pids
+            if not force and not was_suspended:
+                continue
+            ok = self._process_limiter_resume_pid(pid)
+            if was_suspended:
+                with self.state_lock:
+                    self.process_limiter_suspended_pids.discard(pid)
+                    if ok:
+                        self.process_limiter_resume_count += 1
+                        resumed += 1
+        return resumed
+
+    def _process_limiter_resume_all(self, log_result: bool = True) -> int:
+        with self.state_lock:
+            targets = set(self.process_limiter_suspended_pids)
+            self.process_limiter_boost_until_by_pid.clear()
+        resumed = self._process_limiter_resume_many(targets, force=True)
+        with self.state_lock:
+            self.process_limiter_suspended_pids.clear()
+        if log_result and resumed > 0:
+            self.log(f"Process limiter resumed {resumed} process(es).")
+        return resumed
+
+    def _process_limiter_request_boost(self, pid: int, seconds: float = 0.45) -> None:
+        if self.runtime_process_limiter_target_percent <= 0:
+            return
+        if pid <= 0:
+            return
+        until = time.time() + max(0.15, min(seconds, 2.0))
+        with self.state_lock:
+            previous = self.process_limiter_boost_until_by_pid.get(pid, 0.0)
+            if until > previous:
+                self.process_limiter_boost_until_by_pid[pid] = until
+            suspended = pid in self.process_limiter_suspended_pids
+        if suspended:
+            self._process_limiter_resume_many({pid})
+
+    def _process_limiter_worker(self) -> None:
+        while not self.process_limiter_stop_event.is_set():
+            try:
+                target_pids = self._process_limiter_target_pids_snapshot()
+                now = time.time()
+                stale_suspended: set[int] = set()
+                with self.state_lock:
+                    self.process_limiter_boost_until_by_pid = {
+                        pid: ts
+                        for pid, ts in self.process_limiter_boost_until_by_pid.items()
+                        if pid in target_pids and ts > now
+                    }
+                    stale_suspended = self.process_limiter_suspended_pids - target_pids
+                if stale_suspended:
+                    self._process_limiter_resume_many(stale_suspended, force=True)
+
+                if not self._process_limiter_should_throttle():
+                    self._process_limiter_resume_all(log_result=False)
+                    if self.process_limiter_stop_event.wait(0.25):
+                        break
+                    continue
+                if not target_pids:
+                    if self.process_limiter_stop_event.wait(0.3):
+                        break
+                    continue
+
+                cycle_seconds = max(0.08, self.runtime_process_limiter_cycle_ms / 1000.0)
+                active_seconds = max(0.03, cycle_seconds * (self.runtime_process_limiter_target_percent / 100.0))
+                idle_seconds = max(0.03, cycle_seconds - active_seconds)
+                if self.runtime_process_limiter_target_percent >= 100:
+                    self._process_limiter_resume_all(log_result=False)
+                    if self.process_limiter_stop_event.wait(0.25):
+                        break
+                    continue
+                if self.runtime_process_limiter_target_percent <= 0:
+                    with self.state_lock:
+                        self.process_limiter_boost_until_by_pid.clear()
+                    self._process_limiter_suspend_many(target_pids)
+                    if self.process_limiter_stop_event.wait(max(0.08, cycle_seconds)):
+                        break
+                    continue
+
+                self._process_limiter_resume_many(target_pids)
+                if self.process_limiter_stop_event.wait(active_seconds):
+                    break
+                now = time.time()
+                with self.state_lock:
+                    boosted = {pid for pid, ts in self.process_limiter_boost_until_by_pid.items() if ts > now}
+                throttle_targets = {pid for pid in target_pids if pid not in boosted}
+                if throttle_targets:
+                    self._process_limiter_suspend_many(throttle_targets)
+                if self.process_limiter_stop_event.wait(idle_seconds):
+                    break
+            except Exception as exc:
+                self._process_limiter_mark_error(f"worker error: {exc}")
+                if self.process_limiter_stop_event.wait(0.4):
+                    break
+        self._process_limiter_resume_all(log_result=False)
+
+    def _ensure_process_limiter_worker(self) -> None:
+        if not self.process_limiter_supported:
+            return
+        if self.process_limiter_thread and self.process_limiter_thread.is_alive():
+            return
+        self.process_limiter_stop_event.clear()
+        self.process_limiter_thread = threading.Thread(target=self._process_limiter_worker, daemon=True)
+        self.process_limiter_thread.start()
+
+    def _stop_process_limiter_worker(self) -> None:
+        self.process_limiter_stop_event.set()
+        if self.process_limiter_thread and self.process_limiter_thread.is_alive():
+            self.process_limiter_thread.join(timeout=1.0)
+        self.process_limiter_thread = None
+        self._process_limiter_resume_all(log_result=False)
+
     def _effective_pattern(self, pid: int) -> str:
         pattern = self.instance_pattern_override.get(pid, "").strip().lower()
         if pattern in {"balanced", "subtle", "aggressive", "randomized"}:
             return pattern
-        return self.anti_idle_pattern_var.get().strip().lower()
+        return self.runtime_anti_idle_pattern
 
     def _effective_interval(self, pid: int, base_interval: float) -> float:
         override = self.instance_interval_override.get(pid)
         value = override if override is not None else base_interval
-        if self.safe_mode_var.get():
+        if self.runtime_safe_mode:
             value = max(value, 7.0)
         return max(0.5, value)
 
@@ -3724,50 +4430,58 @@ class AntiAfkApp:
             stick_hold = random.uniform(0.02, 0.1)
             gap = random.uniform(0.01, 0.05)
             button_hold = random.uniform(0.09, 0.17)
-        if self.safe_mode_var.get():
+        if self.runtime_safe_mode:
             stick_x = max(700, min(stick_x, 2200))
             stick_hold = max(stick_hold, 0.06)
             gap = max(gap, 0.04)
             button_hold = max(button_hold, 0.16)
         return stick_x, stick_hold, gap, button_hold
 
-    def _resolve_target_hwnds(self, base_interval: float) -> list[int]:
-        windows = self.find_roblox_windows()
+    def _resolve_target_hwnds(self, base_interval: float) -> tuple[list[tuple[int, int]], bool]:
         now = time.time()
-        enabled: list[int] = []
+        with self.state_lock:
+            use_cached = bool(self.window_map) and (now - self.last_instance_scan_at) <= self.runtime_scan_cache_ttl_seconds
+            windows = list(self.window_map) if use_cached else []
+        if not windows:
+            windows = self.find_roblox_windows()
+        had_windows = bool(windows)
+        enabled: list[tuple[int, int]] = []
         priority_by_hwnd: dict[int, int] = {}
-        for hwnd, _title, pid, _pname in windows:
-            if not self.instance_enabled_by_hwnd.get(hwnd, True):
-                continue
-            quarantine_until = self.instance_quarantine_until.get(hwnd, 0.0)
-            if quarantine_until > now:
-                continue
-            interval = self._effective_interval(pid, base_interval)
-            last_jump = self.instance_last_jump.get(hwnd, 0.0)
-            if last_jump and (now - last_jump) < interval:
-                continue
-            enabled.append(hwnd)
-            priority_by_hwnd[hwnd] = self.instance_priority_by_pid.get(pid, 1)
-        if not enabled:
-            return []
+        with self.state_lock:
+            for hwnd, _title, pid, _pname in windows:
+                if self._is_window_input_paused(hwnd, now):
+                    continue
+                if not self.instance_enabled_by_hwnd.get(hwnd, True):
+                    continue
+                quarantine_until = self.instance_quarantine_until.get(hwnd, 0.0)
+                if quarantine_until > now:
+                    continue
+                interval = self._effective_interval(pid, base_interval)
+                last_jump = self.instance_last_jump.get(hwnd, 0.0)
+                if last_jump and (now - last_jump) < interval:
+                    continue
+                enabled.append((hwnd, pid))
+                priority_by_hwnd[hwnd] = self.instance_priority_by_pid.get(pid, 1)
+            if not enabled:
+                return [], had_windows
 
-        if self.jump_mode_var.get() == "round":
-            self.round_robin_index = self.round_robin_index % len(enabled)
-            hwnd = enabled[self.round_robin_index]
-            self.round_robin_index = (self.round_robin_index + 1) % len(enabled)
-            return [hwnd]
-        if self.jump_mode_var.get() == "weighted":
-            wheel: list[int] = []
-            for hwnd in enabled:
-                weight = max(1, min(9, priority_by_hwnd.get(hwnd, 1)))
-                wheel.extend([hwnd] * weight)
-            if not wheel:
-                return []
-            self.round_robin_index = self.round_robin_index % len(wheel)
-            chosen = wheel[self.round_robin_index]
-            self.round_robin_index = (self.round_robin_index + 1) % len(wheel)
-            return [chosen]
-        return enabled
+            if self.runtime_jump_mode == "round":
+                self.round_robin_index = self.round_robin_index % len(enabled)
+                hwnd, pid = enabled[self.round_robin_index]
+                self.round_robin_index = (self.round_robin_index + 1) % len(enabled)
+                return [(hwnd, pid)], had_windows
+            if self.runtime_jump_mode == "weighted":
+                wheel: list[tuple[int, int]] = []
+                for hwnd, pid in enabled:
+                    weight = max(1, min(9, priority_by_hwnd.get(hwnd, 1)))
+                    wheel.extend([(hwnd, pid)] * weight)
+                if not wheel:
+                    return [], had_windows
+                self.round_robin_index = self.round_robin_index % len(wheel)
+                chosen = wheel[self.round_robin_index]
+                self.round_robin_index = (self.round_robin_index + 1) % len(wheel)
+                return [chosen], had_windows
+            return enabled, had_windows
 
     def _reset_gamepad_session(self) -> None:
         self.gamepad = None
@@ -3776,6 +4490,8 @@ class AntiAfkApp:
         self._send_webhook(f"{APP_NAME} Watchdog", "Gamepad session reset after repeated failed cycles.")
 
     def _run_recovery_sequence(self) -> None:
+        if self._enqueue_on_ui_thread(self._run_recovery_sequence):
+            return
         try:
             self.refresh_instance_list(manual=False)
             self.restore_windows()
@@ -3786,11 +4502,88 @@ class AntiAfkApp:
             self.log(f"Recovery sequence failed: {exc}")
             self._record_event(f"Recovery failed: {exc}")
 
+    def _recovery_tier_from_streak(self, streak: int) -> int:
+        if streak >= self.instance_recovery_tier3_threshold:
+            return 3
+        if streak >= self.instance_recovery_tier2_threshold:
+            return 2
+        if streak >= self.instance_recovery_tier1_threshold:
+            return 1
+        return 0
+
+    def _on_instance_send_success(self, hwnd: int) -> None:
+        with self.state_lock:
+            previous_streak = self.instance_send_fail_streak.get(hwnd, 0)
+            previous_tier = self.instance_recovery_tier_by_hwnd.get(hwnd, 0)
+            self.instance_send_fail_streak[hwnd] = 0
+            self.instance_recovery_tier_by_hwnd[hwnd] = 0
+            self.instance_recovery_last_log_at.pop(hwnd, None)
+            self.instance_fail_count[hwnd] = 0
+            self.instance_quarantine_until.pop(hwnd, None)
+        if previous_streak > 0 or previous_tier > 0:
+            self.log(f"Instance HWND {hwnd} recovered (streak reset).")
+            self._record_event(f"Instance recovered HWND {hwnd}")
+
+    def _on_instance_send_failure(self, hwnd: int, pid: int, exc: Exception) -> None:
+        now = time.time()
+        with self.state_lock:
+            streak = self.instance_send_fail_streak.get(hwnd, 0) + 1
+            tier_before = self.instance_recovery_tier_by_hwnd.get(hwnd, 0)
+            tier_now = self._recovery_tier_from_streak(streak)
+            self.instance_send_fail_streak[hwnd] = streak
+            self.instance_recovery_tier_by_hwnd[hwnd] = tier_now
+            self.instance_fail_count[hwnd] = self.instance_fail_count.get(hwnd, 0) + 1
+            self.instance_recovery_last_log_at.setdefault(hwnd, 0.0)
+
+            backoff_seconds = 0
+            if tier_now == 1:
+                backoff_seconds = self.instance_recovery_tier1_backoff_seconds
+            elif tier_now == 2:
+                backoff_seconds = self.instance_recovery_tier2_backoff_seconds
+            elif tier_now >= 3:
+                backoff_seconds = max(self.instance_recovery_tier3_backoff_seconds, self.instance_quarantine_seconds)
+            if backoff_seconds > 0:
+                until = now + backoff_seconds
+                current_until = self.instance_quarantine_until.get(hwnd, 0.0)
+                if until > current_until:
+                    self.instance_quarantine_until[hwnd] = until
+            pause_left = max(0, int(self.instance_quarantine_until.get(hwnd, 0.0) - now))
+            last_log_at = self.instance_recovery_last_log_at.get(hwnd, 0.0)
+            username = self.pid_username.get(pid, "unknown")
+
+        if tier_now == 2:
+            try:
+                self.spoof_focus(hwnd, True)
+                self.spoof_focus(hwnd, False)
+            except Exception:
+                pass
+        elif tier_now >= 3:
+            self._release_virtual_inputs()
+
+        should_log = False
+        if tier_now != tier_before:
+            should_log = True
+        elif (now - last_log_at) >= 20:
+            should_log = True
+        if should_log:
+            self.log(
+                f"Per-window recovery tier {tier_now} for HWND {hwnd} (PID {pid}, {username}) "
+                f"after send failure streak={streak}. Backoff={pause_left}s. Last error: {exc}"
+            )
+            self._record_event(f"Recovery tier {tier_now} HWND {hwnd}")
+            with self.state_lock:
+                self.instance_recovery_last_log_at[hwnd] = now
+
     def jump_once(self, base_interval: float) -> tuple[bool, str]:
         if self._is_in_pause_window():
             with self.metrics_lock:
                 self.session_cycles += 1
             return False, "paused"
+        if self.runtime_process_limiter_enabled and self.runtime_process_limiter_target_percent <= 0:
+            with self.metrics_lock:
+                self.session_cycles += 1
+            return False, "frozen_0_cpu"
+        self._update_roblox_input_pause()
 
         self.ensure_gamepad()
         vg_module = cast(Any, self._ensure_vgamepad_module())
@@ -3798,50 +4591,60 @@ class AntiAfkApp:
         if gamepad is None:
             raise RuntimeError("Virtual gamepad is not initialized.")
 
-        target_hwnds = self._resolve_target_hwnds(base_interval)
-        if not target_hwnds:
+        targets, had_windows = self._resolve_target_hwnds(base_interval)
+        if not targets:
             with self.metrics_lock:
                 self.session_cycles += 1
-            if not self.window_map:
+            if not had_windows:
                 return False, "no_windows"
             return False, "not_due"
 
-        for hwnd in target_hwnds:
-            self.spoof_focus(hwnd, True)
         sent_count = 0
-        for hwnd in target_hwnds:
-            pid = next((pid for h, _t, pid, _p in self.window_map if h == hwnd), None)
-            if pid is None:
-                self.spoof_focus(hwnd, False)
-                continue
+        had_send_failure = False
+        for hwnd, pid in targets:
+            self._process_limiter_request_boost(pid)
+            self.spoof_focus(hwnd, True)
             pattern = self._effective_pattern(pid)
             stick_x, stick_hold, gap, button_hold = self._profile_from_pattern(pattern)
-            gamepad.left_joystick(stick_x, 0)
-            gamepad.update()
-            time.sleep(stick_hold)
-            gamepad.left_joystick(0, 0)
-            gamepad.update()
-            time.sleep(gap)
-            jump_button = vg_module.XUSB_BUTTON.XUSB_GAMEPAD_A
-            gamepad.press_button(jump_button)
-            gamepad.update()
-            time.sleep(button_hold)
-            gamepad.release_button(jump_button)
-            gamepad.update()
-            self.spoof_focus(hwnd, False)
-            self.instance_last_jump[hwnd] = time.time()
-            self.instance_attempt_count[hwnd] = self.instance_attempt_count.get(hwnd, 0) + 1
-            self.instance_fail_count[hwnd] = 0
-            self.instance_quarantine_until.pop(hwnd, None)
-            sent_count += 1
+            try:
+                gamepad.left_joystick(stick_x, 0)
+                gamepad.update()
+                time.sleep(stick_hold)
+                gamepad.left_joystick(0, 0)
+                gamepad.update()
+                time.sleep(gap)
+                jump_button = vg_module.XUSB_BUTTON.XUSB_GAMEPAD_A
+                gamepad.press_button(jump_button)
+                gamepad.update()
+                time.sleep(button_hold)
+                gamepad.release_button(jump_button)
+                gamepad.update()
+                with self.state_lock:
+                    self.instance_last_jump[hwnd] = time.time()
+                    self.instance_attempt_count[hwnd] = self.instance_attempt_count.get(hwnd, 0) + 1
+                self._on_instance_send_success(hwnd)
+                sent_count += 1
+            except Exception as exc:
+                had_send_failure = True
+                with self.metrics_lock:
+                    self.session_errors += 1
+                self._on_instance_send_failure(hwnd, pid, exc)
+            finally:
+                self.spoof_focus(hwnd, False)
 
         with self.metrics_lock:
             self.session_cycles += 1
             self.session_jumps += sent_count
 
-        self.root.after(0, self.update_health_panel)
-        self.root.after(0, lambda: self.refresh_instance_list(manual=False))
-        return sent_count > 0, "sent" if sent_count > 0 else "not_due"
+        now = time.time()
+        if (now - self.last_health_ui_update_at) >= self.health_ui_update_interval_seconds:
+            self.last_health_ui_update_at = now
+            self.root.after(0, self.update_health_panel)
+        if sent_count > 0:
+            return True, "sent"
+        if had_send_failure:
+            return False, "send_failed"
+        return False, "not_due"
 
     def test_jump(self) -> None:
         try:
@@ -3859,8 +4662,6 @@ class AntiAfkApp:
         self.log(f"Anti-AFK loop started (interval={interval:.2f}s).")
         self._record_event("Loop started")
         self._send_webhook(APP_NAME, "Anti-AFK loop started.")
-        no_window_threshold = self.parse_no_windows_watchdog_threshold() if self.watchdog_enabled_var.get() else 999999
-        jump_fail_threshold = self.parse_jump_fail_watchdog_threshold() if self.watchdog_enabled_var.get() else 999999
 
         while not self.stop_event.is_set():
             try:
@@ -3879,7 +4680,7 @@ class AntiAfkApp:
                     self.failed_cycles += 1
                     if reason == "no_windows":
                         self.no_window_cycles += 1
-                        if self.start_when_windows_found_var.get():
+                        if self.runtime_start_when_windows_found:
                             if not self.waiting_for_windows:
                                 self.waiting_for_windows = True
                                 self.log("Waiting for Roblox windows to appear before resuming jumps.")
@@ -3893,20 +4694,23 @@ class AntiAfkApp:
                         if (now - self.last_not_due_log_at) >= 30:
                             self.last_not_due_log_at = now
                             self.log("Cycle skipped (instance interval not due).")
+                    elif reason == "send_failed":
+                        self.jump_fail_cycles += 1
+                        self.log("Cycle had per-window send failures; recovery tiers applied.")
                     else:
                         self.jump_fail_cycles += 1
                         self.log("Cycle skipped (quarantine or per-instance interval not due).")
 
-                if self.watchdog_enabled_var.get() and self.no_window_cycles >= no_window_threshold:
+                if self.runtime_watchdog_enabled and self.no_window_cycles >= self.runtime_no_window_threshold:
                     self.log("Watchdog: no windows threshold reached, refreshing instance scan.")
                     self._record_event("Watchdog no-windows")
                     self.refresh_instance_list(manual=False)
                     self.no_window_cycles = 0
 
-                if self.watchdog_enabled_var.get() and self.jump_fail_cycles >= jump_fail_threshold:
+                if self.runtime_watchdog_enabled and self.jump_fail_cycles >= self.runtime_jump_fail_threshold:
                     self.log("Watchdog: jump-fail threshold reached.")
                     self._record_event("Watchdog jump-fail")
-                    if self.recovery_enabled_var.get():
+                    if self.runtime_recovery_enabled:
                         self._run_recovery_sequence()
                     self._reset_gamepad_session()
                     self.jump_fail_cycles = 0
@@ -3937,6 +4741,7 @@ class AntiAfkApp:
             return
 
         try:
+            self._sync_runtime_settings_from_ui()
             self.validate_runtime_settings()
             interval = self.parse_interval()
             self.refresh_instance_list(manual=False)
@@ -3960,8 +4765,18 @@ class AntiAfkApp:
         self.no_window_cycles = 0
         self.jump_fail_cycles = 0
         self.waiting_for_windows = False
+        self.instance_send_fail_streak.clear()
+        self.instance_recovery_tier_by_hwnd.clear()
+        self.instance_recovery_last_log_at.clear()
+        self.roblox_input_pause_until_by_hwnd.clear()
+        self.roblox_input_pause_logged_hwnds.clear()
+        self.last_system_input_tick = self._current_input_tick()
         self.stop_event.clear()
-        self.worker_thread = threading.Thread(target=self.worker, args=(interval,), daemon=True)
+        self.worker_thread = threading.Thread(
+            target=self.worker,
+            args=(interval,),
+            daemon=True,
+        )
         self.worker_thread.start()
         self.set_running_ui(True)
         self._write_recovery_snapshot(force=True)
@@ -3971,7 +4786,14 @@ class AntiAfkApp:
         self.stop_event.set()
         if self.worker_thread and self.worker_thread.is_alive():
             self.worker_thread.join(timeout=0.5)
+        if self.process_limiter_only_when_running_var.get():
+            self._process_limiter_resume_all(log_result=False)
         self.waiting_for_windows = False
+        self.instance_send_fail_streak.clear()
+        self.instance_recovery_tier_by_hwnd.clear()
+        self.instance_recovery_last_log_at.clear()
+        self.roblox_input_pause_until_by_hwnd.clear()
+        self.roblox_input_pause_logged_hwnds.clear()
         self.set_running_ui(False)
         self._write_recovery_snapshot(force=True)
         self._write_session_report("stop")
@@ -3993,11 +4815,15 @@ class AntiAfkApp:
         self.root.after(1000, self._schedule_stats_update)
 
     def _schedule_instance_poll(self) -> None:
+        self._sync_runtime_settings_from_ui()
+        self._ensure_process_limiter_worker()
         self.refresh_instance_list(manual=False)
+        self._refresh_process_limiter_status()
         self._poll_biome_tracker()
         self._check_profile_scheduler()
         self._check_instance_health_alerts()
-        self.root.after(2500, self._schedule_instance_poll)
+        delay_ms = 3500 if self.is_running else 2500
+        self.root.after(delay_ms, self._schedule_instance_poll)
 
     def _check_profile_scheduler(self) -> None:
         if not self.scheduler_enabled_var.get():
@@ -4033,15 +4859,6 @@ class AntiAfkApp:
         self._record_event(f"Scheduler preset: {preset_name}")
 
     def _check_instance_health_alerts(self) -> None:
-        active_hwnds = {hwnd for hwnd, _title, _pid, _pname in self.window_map}
-        self.last_instance_health_alert = {
-            hwnd: ts for hwnd, ts in self.last_instance_health_alert.items() if hwnd in active_hwnds
-        }
-        self.instance_attempt_count = {hwnd: count for hwnd, count in self.instance_attempt_count.items() if hwnd in active_hwnds}
-        self.instance_fail_count = {hwnd: count for hwnd, count in self.instance_fail_count.items() if hwnd in active_hwnds}
-        self.instance_quarantine_until = {
-            hwnd: ts for hwnd, ts in self.instance_quarantine_until.items() if hwnd in active_hwnds and ts > time.time()
-        }
         if not self.is_running or not self.health_alert_enabled_var.get():
             return
         try:
@@ -4049,28 +4866,55 @@ class AntiAfkApp:
         except ValueError:
             threshold_seconds = 180
         now = time.time()
-        for hwnd, _title, pid, _pname in self.window_map:
-            if not self.instance_enabled_by_hwnd.get(hwnd, True):
-                continue
-            baseline = self.instance_last_jump.get(hwnd)
-            if baseline is None:
-                baseline = self.session_started_at if self.session_started_at is not None else now
-            gap = now - baseline
-            if gap < threshold_seconds:
-                continue
-            last_alert = self.last_instance_health_alert.get(hwnd, 0.0)
-            if now - last_alert < threshold_seconds:
-                continue
-            self.last_instance_health_alert[hwnd] = now
-            username = self.pid_username.get(pid, "unknown")
-            msg = (
-                f"No successful jump for PID {pid} ({username}) "
-                f"for {int(gap // 60)}m {int(gap % 60)}s."
-            )
-            self.instance_fail_count[hwnd] = self.instance_fail_count.get(hwnd, 0) + 1
-            if self.instance_fail_count[hwnd] >= self.instance_quarantine_fail_threshold:
-                self.instance_quarantine_until[hwnd] = now + self.instance_quarantine_seconds
-                self.instance_fail_count[hwnd] = 0
+        alerts: list[tuple[int, str, bool]] = []
+        with self.state_lock:
+            active_hwnds = {hwnd for hwnd, _title, _pid, _pname in self.window_map}
+            self.last_instance_health_alert = {
+                hwnd: ts for hwnd, ts in self.last_instance_health_alert.items() if hwnd in active_hwnds
+            }
+            self.instance_attempt_count = {
+                hwnd: count for hwnd, count in self.instance_attempt_count.items() if hwnd in active_hwnds
+            }
+            self.instance_fail_count = {hwnd: count for hwnd, count in self.instance_fail_count.items() if hwnd in active_hwnds}
+            self.instance_send_fail_streak = {
+                hwnd: count for hwnd, count in self.instance_send_fail_streak.items() if hwnd in active_hwnds
+            }
+            self.instance_recovery_tier_by_hwnd = {
+                hwnd: tier for hwnd, tier in self.instance_recovery_tier_by_hwnd.items() if hwnd in active_hwnds
+            }
+            self.instance_recovery_last_log_at = {
+                hwnd: ts for hwnd, ts in self.instance_recovery_last_log_at.items() if hwnd in active_hwnds
+            }
+            self.instance_quarantine_until = {
+                hwnd: ts for hwnd, ts in self.instance_quarantine_until.items() if hwnd in active_hwnds and ts > now
+            }
+            for hwnd, _title, pid, _pname in self.window_map:
+                if not self.instance_enabled_by_hwnd.get(hwnd, True):
+                    continue
+                baseline = self.instance_last_jump.get(hwnd)
+                if baseline is None:
+                    baseline = self.session_started_at if self.session_started_at is not None else now
+                gap = now - baseline
+                if gap < threshold_seconds:
+                    continue
+                last_alert = self.last_instance_health_alert.get(hwnd, 0.0)
+                if now - last_alert < threshold_seconds:
+                    continue
+                self.last_instance_health_alert[hwnd] = now
+                username = self.pid_username.get(pid, "unknown")
+                msg = (
+                    f"No successful jump for PID {pid} ({username}) "
+                    f"for {int(gap // 60)}m {int(gap % 60)}s."
+                )
+                self.instance_fail_count[hwnd] = self.instance_fail_count.get(hwnd, 0) + 1
+                quarantined = False
+                if self.instance_fail_count[hwnd] >= self.instance_quarantine_fail_threshold:
+                    self.instance_quarantine_until[hwnd] = now + self.instance_quarantine_seconds
+                    self.instance_fail_count[hwnd] = 0
+                    quarantined = True
+                alerts.append((pid, msg, quarantined))
+        for pid, msg, quarantined in alerts:
+            if quarantined:
                 self.log(f"Instance PID {pid} quarantined for {self.instance_quarantine_seconds}s due to repeated stale jumps.")
                 self._record_event(f"Quarantine PID {pid}")
             self.log(f"Instance health alert: {msg}")
@@ -4079,12 +4923,18 @@ class AntiAfkApp:
 
     def _enabled_by_pid_snapshot(self) -> dict[int, bool]:
         mapping: dict[int, bool] = {}
-        for hwnd, _title, pid, _pname in self.window_map:
-            mapping[pid] = self.instance_enabled_by_hwnd.get(hwnd, True)
+        with self.state_lock:
+            for hwnd, _title, pid, _pname in self.window_map:
+                mapping[pid] = self.instance_enabled_by_hwnd.get(hwnd, True)
         return mapping
 
     def _collect_config_data(self) -> dict[str, Any]:
+        with self.state_lock:
+            interval_override_snapshot = dict(self.instance_interval_override)
+            pattern_override_snapshot = dict(self.instance_pattern_override)
+            priority_snapshot = dict(self.instance_priority_by_pid)
         return {
+            "config_version": APP_CONFIG_VERSION,
             "interval_seconds": self.interval_var.get().strip(),
             "auto_realign": bool(self.auto_realign_var.get()),
             "enabled_by_pid": {str(pid): enabled for pid, enabled in self._enabled_by_pid_snapshot().items()},
@@ -4103,6 +4953,8 @@ class AntiAfkApp:
             "hotkeys_enabled": bool(self.hotkeys_enabled_var.get()),
             "wait_for_windows": bool(self.start_when_windows_found_var.get()),
             "safe_mode": bool(self.safe_mode_var.get()),
+            "roblox_input_pause_enabled": bool(self.roblox_input_pause_enabled),
+            "roblox_input_pause_seconds": float(self.roblox_input_pause_seconds),
             "quick_pause_minutes": self.manual_pause_minutes_var.get().strip(),
             "profile_hotkey_1": self.profile_hotkey_1_var.get().strip(),
             "profile_hotkey_2": self.profile_hotkey_2_var.get().strip(),
@@ -4116,6 +4968,11 @@ class AntiAfkApp:
             "scheduler_slot1_preset": self.scheduler_slot1_preset_var.get().strip(),
             "scheduler_slot2_time": self.scheduler_slot2_time_var.get().strip(),
             "scheduler_slot2_preset": self.scheduler_slot2_preset_var.get().strip(),
+            "process_limiter_enabled": bool(self.process_limiter_enabled_var.get()),
+            "process_limiter_auto_mode": bool(self.process_limiter_auto_mode_var.get()),
+            "process_limiter_only_when_running": bool(self.process_limiter_only_when_running_var.get()),
+            "process_limiter_target_percent": self.process_limiter_target_percent_var.get().strip(),
+            "process_limiter_cycle_ms": self.process_limiter_cycle_ms_var.get().strip(),
             "health_alert_enabled": bool(self.health_alert_enabled_var.get()),
             "health_alert_minutes": self.health_alert_minutes_var.get().strip(),
             "autosave_enabled": bool(self.autosave_enabled_var.get()),
@@ -4125,10 +4982,49 @@ class AntiAfkApp:
             "biome_action": self.biome_action_var.get().strip(),
             "biome_action_preset": self.biome_action_preset_var.get().strip(),
             "recovery_enabled": bool(self.recovery_enabled_var.get()),
-            "instance_interval_override_by_pid": {str(pid): value for pid, value in self.instance_interval_override.items()},
-            "instance_pattern_override_by_pid": {str(pid): value for pid, value in self.instance_pattern_override.items()},
-            "instance_priority_by_pid": {str(pid): value for pid, value in self.instance_priority_by_pid.items()},
+            "instance_interval_override_by_pid": {str(pid): value for pid, value in interval_override_snapshot.items()},
+            "instance_pattern_override_by_pid": {str(pid): value for pid, value in pattern_override_snapshot.items()},
+            "instance_priority_by_pid": {str(pid): value for pid, value in priority_snapshot.items()},
         }
+
+    def _normalize_config_payload(self, raw: dict[str, Any]) -> tuple[dict[str, Any], bool]:
+        data = dict(raw)
+        changed = False
+        try:
+            version = int(data.get("config_version", 0))
+        except (TypeError, ValueError):
+            version = 0
+            changed = True
+
+        if version != APP_CONFIG_VERSION:
+            data["config_version"] = APP_CONFIG_VERSION
+            changed = True
+
+        dict_keys = (
+            "enabled_by_pid",
+            "instance_interval_override_by_pid",
+            "instance_pattern_override_by_pid",
+            "instance_priority_by_pid",
+        )
+        for key in dict_keys:
+            value = data.get(key)
+            if value is None:
+                continue
+            if not isinstance(value, dict):
+                data.pop(key, None)
+                changed = True
+        return data, changed
+
+    def _backup_invalid_config(self) -> str | None:
+        if not os.path.exists(self.config_path):
+            return None
+        stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        backup_path = f"{self.config_path}.bad-{stamp}.json"
+        try:
+            shutil.copy2(self.config_path, backup_path)
+            return backup_path
+        except Exception:
+            return None
 
     def _apply_config_data(self, data: dict[str, Any]) -> None:
         interval = str(data.get("interval_seconds", "5"))
@@ -4176,10 +5072,11 @@ class AntiAfkApp:
 
         self.interval_var.set(interval)
         self.auto_realign_var.set(auto_realign)
-        self.loaded_enabled_by_pid = enabled_by_pid
-        self.instance_interval_override = interval_override
-        self.instance_pattern_override = pattern_override
-        self.instance_priority_by_pid = priority_by_pid
+        with self.state_lock:
+            self.loaded_enabled_by_pid = enabled_by_pid
+            self.instance_interval_override = interval_override
+            self.instance_pattern_override = pattern_override
+            self.instance_priority_by_pid = priority_by_pid
         jump_mode = str(data.get("jump_mode", "all")).strip().lower()
         if jump_mode not in {"all", "round", "weighted"}:
             jump_mode = "all"
@@ -4205,6 +5102,12 @@ class AntiAfkApp:
         self.hotkeys_enabled_var.set(bool(data.get("hotkeys_enabled", True)))
         self.start_when_windows_found_var.set(bool(data.get("wait_for_windows", True)))
         self.safe_mode_var.set(bool(data.get("safe_mode", False)))
+        self.roblox_input_pause_enabled = bool(data.get("roblox_input_pause_enabled", True))
+        try:
+            pause_seconds = float(data.get("roblox_input_pause_seconds", 2.0))
+        except (TypeError, ValueError):
+            pause_seconds = 2.0
+        self.roblox_input_pause_seconds = max(0.2, min(pause_seconds, 10.0))
         self.manual_pause_minutes_var.set(str(data.get("quick_pause_minutes", "10")))
         self.profile_hotkey_1_var.set(str(data.get("profile_hotkey_1", "default")).strip() or "default")
         self.profile_hotkey_2_var.set(str(data.get("profile_hotkey_2", "farming")).strip() or "farming")
@@ -4218,6 +5121,17 @@ class AntiAfkApp:
         self.scheduler_slot1_preset_var.set(str(data.get("scheduler_slot1_preset", "day")))
         self.scheduler_slot2_time_var.set(str(data.get("scheduler_slot2_time", "23:30")))
         self.scheduler_slot2_preset_var.set(str(data.get("scheduler_slot2_preset", "overnight")))
+        self.process_limiter_enabled_var.set(bool(data.get("process_limiter_enabled", False)))
+        self.process_limiter_auto_mode_var.set(bool(data.get("process_limiter_auto_mode", False)))
+        self.process_limiter_only_when_running_var.set(bool(data.get("process_limiter_only_when_running", True)))
+        self.process_limiter_target_percent_var.set(str(data.get("process_limiter_target_percent", "40")))
+        self.process_limiter_cycle_ms_var.set(str(data.get("process_limiter_cycle_ms", "180")))
+        if self.process_limiter_enabled_var.get() and not self.process_limiter_supported:
+            self.process_limiter_enabled_var.set(False)
+            self.process_limiter_auto_mode_var.set(False)
+        if self.process_limiter_auto_mode_var.get():
+            self.process_limiter_target_percent_var.set("0")
+            self.process_limiter_only_when_running_var.set(False)
         self.health_alert_enabled_var.set(bool(data.get("health_alert_enabled", True)))
         self.health_alert_minutes_var.set(str(data.get("health_alert_minutes", "3")))
         self.autosave_enabled_var.set(bool(data.get("autosave_enabled", True)))
@@ -4231,6 +5145,7 @@ class AntiAfkApp:
         self.biome_action_preset_var.set(str(data.get("biome_action_preset", "default")).strip())
         self.recovery_enabled_var.set(bool(data.get("recovery_enabled", True)))
         self._apply_selected_theme()
+        self._sync_runtime_settings_from_ui()
         self._set_global_hotkeys_enabled(self.hotkeys_enabled_var.get(), log_result=False)
         self.refresh_instance_list(manual=False)
 
@@ -4262,13 +5177,35 @@ class AntiAfkApp:
         if self.startup_preset_var.get().strip() not in names:
             self.startup_preset_var.set(names[0])
 
+    @staticmethod
+    def _atomic_write_bytes(path: str, data: bytes) -> None:
+        directory = os.path.dirname(path) or "."
+        os.makedirs(directory, exist_ok=True)
+        fd, temp_path = tempfile.mkstemp(prefix=".tmp-", suffix=".part", dir=directory)
+        try:
+            with os.fdopen(fd, "wb") as handle:
+                handle.write(data)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temp_path, path)
+        except Exception:
+            try:
+                os.remove(temp_path)
+            except OSError:
+                pass
+            raise
+
+    @classmethod
+    def _atomic_write_json(cls, path: str, data: Any) -> None:
+        payload = json.dumps(data, indent=2).encode("utf-8") + b"\n"
+        cls._atomic_write_bytes(path, payload)
+
     def save_preset(self) -> None:
         name = self._sanitize_preset_name(self.preset_name_var.get())
         path = self._preset_path(name)
         data = self._collect_config_data()
         try:
-            with open(path, "w", encoding="utf-8") as handle:
-                json.dump(data, handle, indent=2)
+            self._atomic_write_json(path, data)
             self.preset_name_var.set(name)
             self._refresh_preset_list()
             self.log(f"Preset saved: {name}")
@@ -4335,6 +5272,9 @@ class AntiAfkApp:
             f"Wait for windows mode: {'ON' if self.start_when_windows_found_var.get() else 'OFF'}",
             f"Safe mode: {'ON' if self.safe_mode_var.get() else 'OFF'}",
             f"Scheduler: {'ON' if self.scheduler_enabled_var.get() else 'OFF'} ({self.scheduler_slot1_time_var.get()}->{self.scheduler_slot1_preset_var.get()}, {self.scheduler_slot2_time_var.get()}->{self.scheduler_slot2_preset_var.get()})",
+            f"Process limiter: {'ON' if self.process_limiter_enabled_var.get() else 'OFF'} ({'AUTO 0% freeze' if self.process_limiter_auto_mode_var.get() else (self.process_limiter_target_percent_var.get().strip() or '40') + '%'} / {self.process_limiter_cycle_ms_var.get().strip() or '180'}ms, {'run-only' if self.process_limiter_only_when_running_var.get() else 'always'})",
+            f"Process limiter runtime support: {'YES' if self.process_limiter_supported else 'NO'}",
+            f"Process limiter status: {self.process_limiter_status_var.get()}",
             f"Instance health alerts: {'ON' if self.health_alert_enabled_var.get() else 'OFF'} ({self.health_alert_minutes_var.get().strip() or '3'} min)",
             f"Recovery auto-save: {'ON' if self.autosave_enabled_var.get() else 'OFF'} ({self.autosave_minutes_var.get().strip() or '2'} min)",
             f"Recovery sequence: {'ON' if self.recovery_enabled_var.get() else 'OFF'}",
@@ -4394,8 +5334,7 @@ class AntiAfkApp:
     def save_config(self) -> None:
         data = self._collect_config_data()
         try:
-            with open(self.config_path, "w", encoding="utf-8") as f:
-                json.dump(data, f, indent=2)
+            self._atomic_write_json(self.config_path, data)
             self.log(f"Config saved: {self.config_path}")
         except Exception as exc:
             messagebox.showerror("Save config failed", str(exc))
@@ -4411,34 +5350,48 @@ class AntiAfkApp:
                 data = json.load(f)
             if not isinstance(data, dict):
                 raise ValueError("Config file is invalid.")
-            self._apply_config_data(data)
+            normalized, changed = self._normalize_config_payload(data)
+            self._apply_config_data(normalized)
+            if changed:
+                try:
+                    self._atomic_write_json(self.config_path, normalized)
+                except Exception:
+                    pass
             self.log(f"Config loaded: {self.config_path}")
         except Exception as exc:
+            backup_path = self._backup_invalid_config()
+            self.log(f"Config load failed, using in-memory defaults: {exc}")
+            if backup_path:
+                self.log(f"Invalid config backup saved: {backup_path}")
             if not silent:
-                messagebox.showerror("Load config failed", str(exc))
+                msg = f"{exc}\n\nUsing current defaults."
+                if backup_path:
+                    msg += f"\nBackup: {backup_path}"
+                messagebox.showerror("Load config failed", msg)
 
     def export_instances(self, mode: str) -> None:
         rows: list[dict[str, Any]] = []
-        for hwnd, title, pid, pname in self.window_map:
-            attempts = self.instance_attempt_count.get(hwnd, 0)
-            fails = self.instance_fail_count.get(hwnd, 0)
-            reliability = None if attempts == 0 else max(0.0, (attempts - fails) * 100 / attempts)
-            rows.append(
-                {
-                    "enabled": self.instance_enabled_by_hwnd.get(hwnd, True),
-                    "pid": pid,
-                    "hwnd": hwnd,
-                    "process": pname,
-                    "username": self.pid_username.get(pid, ""),
-                    "identity": self.pid_identity_confidence.get(pid, "unknown"),
-                    "last_jump": self.instance_last_jump.get(hwnd),
-                    "priority": self.instance_priority_by_pid.get(pid, 1),
-                    "interval_override": self.instance_interval_override.get(pid),
-                    "pattern_override": self.instance_pattern_override.get(pid, ""),
-                    "reliability_percent": reliability,
-                    "title": title,
-                }
-            )
+        with self.state_lock:
+            for hwnd, title, pid, pname in self.window_map:
+                attempts = self.instance_attempt_count.get(hwnd, 0)
+                fails = self.instance_fail_count.get(hwnd, 0)
+                reliability = None if attempts == 0 else max(0.0, (attempts - fails) * 100 / attempts)
+                rows.append(
+                    {
+                        "enabled": self.instance_enabled_by_hwnd.get(hwnd, True),
+                        "pid": pid,
+                        "hwnd": hwnd,
+                        "process": pname,
+                        "username": self.pid_username.get(pid, ""),
+                        "identity": self.pid_identity_confidence.get(pid, "unknown"),
+                        "last_jump": self.instance_last_jump.get(hwnd),
+                        "priority": self.instance_priority_by_pid.get(pid, 1),
+                        "interval_override": self.instance_interval_override.get(pid),
+                        "pattern_override": self.instance_pattern_override.get(pid, ""),
+                        "reliability_percent": reliability,
+                        "title": title,
+                    }
+                )
 
         if mode == "json":
             path = filedialog.asksaveasfilename(defaultextension=".json", filetypes=[("JSON", "*.json")])
@@ -4709,6 +5662,7 @@ class AntiAfkApp:
         try:
             with zipfile.ZipFile(path, "r") as zf:
                 members = zf.namelist()
+                expected_checksums: dict[str, str] = {}
                 if "portable-metadata.json" in members:
                     try:
                         meta = json.loads(zf.read("portable-metadata.json").decode("utf-8", errors="ignore"))
@@ -4716,21 +5670,42 @@ class AntiAfkApp:
                             src_version = str(meta.get("version", "")).strip()
                             if src_version:
                                 self.log(f"Portable import metadata version: {src_version}")
-                    except Exception:
-                        pass
+                            raw_checksums = meta.get("checksums_sha256")
+                            if isinstance(raw_checksums, dict):
+                                for name, digest in raw_checksums.items():
+                                    if isinstance(name, str) and isinstance(digest, str) and digest.strip():
+                                        expected_checksums[name.replace("\\", "/")] = digest.strip().lower()
+                    except Exception as exc:
+                        self.log(f"Portable metadata parse warning: {exc}")
+
+                staged_files: list[tuple[str, bytes]] = []
+
+                def _stage_member(member_name: str, target_path: str) -> None:
+                    content = zf.read(member_name)
+                    normalized = member_name.replace("\\", "/")
+                    if expected_checksums:
+                        expected = expected_checksums.get(normalized)
+                        if not expected:
+                            raise ValueError(f"Missing checksum for '{normalized}' in portable metadata.")
+                        actual = hashlib.sha256(content).hexdigest().lower()
+                        if actual != expected:
+                            raise ValueError(f"Checksum mismatch for '{normalized}'.")
+                    staged_files.append((target_path, content))
+
                 if "stayactive_config.json" in members:
-                    with zf.open("stayactive_config.json") as src, open(self.config_path, "wb") as dst:
-                        dst.write(src.read())
+                    _stage_member("stayactive_config.json", self.config_path)
                 if "stayactive_themes.json" in members:
-                    with zf.open("stayactive_themes.json") as src, open(self.theme_config_path, "wb") as dst:
-                        dst.write(src.read())
+                    _stage_member("stayactive_themes.json", self.theme_config_path)
+
                 os.makedirs(self.presets_dir, exist_ok=True)
                 for name in members:
                     normalized = name.replace("\\", "/")
                     if normalized.startswith("presets/") and normalized.lower().endswith(".json"):
                         target = os.path.join(self.presets_dir, os.path.basename(normalized))
-                        with zf.open(name) as src, open(target, "wb") as dst:
-                            dst.write(src.read())
+                        _stage_member(name, target)
+
+                for target, content in staged_files:
+                    self._atomic_write_bytes(target, content)
             self._refresh_preset_list()
             self._load_custom_themes()
             self.load_config(silent=True)
@@ -4741,8 +5716,8 @@ class AntiAfkApp:
 
     def build_exe(self) -> None:
         exe_name = APP_NAME.replace(" ", "")
-        icon_asset = APP_ICON_ICO
-        icon_png_asset = APP_ICON_PNG
+        icon_asset = self._resource_path(APP_ICON_ICO)
+        icon_png_asset = self._resource_path(APP_ICON_PNG)
         cmd = [
             sys.executable,
             "-m",
@@ -4754,12 +5729,17 @@ class AntiAfkApp:
             "--uac-admin",
             "--name",
             exe_name,
-            "--icon",
-            icon_asset,
-            "--add-data",
-            f"{icon_asset};.",
-            "--add-data",
-            f"{icon_png_asset};.",
+        ]
+        if os.path.exists(icon_asset):
+            cmd.extend(["--icon", icon_asset, "--add-data", f"{icon_asset};."])
+        else:
+            self.log(f"Build EXE warning: icon not found ({APP_ICON_ICO}), continuing without --icon.")
+        if os.path.exists(icon_png_asset):
+            cmd.extend(["--add-data", f"{icon_png_asset};."])
+        else:
+            self.log(f"Build EXE warning: PNG icon not found ({APP_ICON_PNG}).")
+        cmd.extend(
+            [
             "--collect-binaries",
             "vgamepad",
             "--collect-data",
@@ -4767,12 +5747,14 @@ class AntiAfkApp:
             "--collect-submodules",
             "vgamepad",
             "main.py",
-        ]
+            ]
+        )
 
         def _worker() -> None:
             self.log("Build EXE started...")
             try:
-                result = subprocess.run(cmd, cwd=os.getcwd(), capture_output=True, text=True, timeout=600)
+                source_dir = os.path.dirname(os.path.abspath(__file__))
+                result = subprocess.run(cmd, cwd=source_dir, capture_output=True, text=True, timeout=600)
                 if result.returncode == 0:
                     self.log(f"Build EXE complete: dist/{exe_name}.exe")
                 else:
@@ -4829,6 +5811,7 @@ class AntiAfkApp:
 
     def on_close(self) -> None:
         self.stop()
+        self._stop_process_limiter_worker()
         self._write_recovery_snapshot(force=True)
         self.save_config()
         self._write_session_report("shutdown")

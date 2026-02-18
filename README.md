@@ -58,6 +58,7 @@
 - Tracks identity + avatars and gives confidence labels for lookups.
 - Includes biome monitoring, rare-biome webhook alerts, and diagnostics export.
 - Ships with quality-of-life tools: window align/restore, presets, header theme dropdown, updater checks, and tray support.
+- Includes a dedicated Performance tab with a Roblox process limiter for low-CPU multi-account setups.
 
 <table>
   <tr>
@@ -124,20 +125,32 @@ pip install pystray pillow
 - Identity detection from logs with Roblox API enrichment.
 - Improved identity mapping reliability with stronger log matching and username/userId pairing.
 - Session stats, watchdog recovery sequence, and safe pause schedule.
+- Performance tab with process limiter controls (target %, cycle ms, run-only gate, and resume-all).
+- Auto limiter mode for instant 0% freeze behavior with no calibration.
+- Limiter status panel + per-process state table (active/suspended/boosted).
 - In-app update checks + release page shortcut.
 - Config/preset validation improvements (pause schedule + webhook URL checks).
 - Config save/load, portable bundle import/export, JSON/CSV export, and debug bundle export.
 - Dedicated StayActive header logo for clearer branding/readability.
 - Event timeline panel and copy-to-clipboard diagnostics utilities.
 
-## Patch Notes (v0.1.4)
+## Patch Notes (v0.1.5)
+
+- Added a new **Performance** tab with a full Roblox process limiter.
+- Added duty-cycle limiting controls: target active time (%) and cycle length (ms).
+- Added **Auto mode** that forces immediate 0% freeze behavior (no manual calibration).
+- Added persistent freeze targeting across Roblox process scans so 0% mode does not drop when window detection flickers.
+- Added limiter safety controls: **Only while macro is running** and **Resume All**.
+- Added per-process limiter state visibility (PID, state, boost window, title).
+- Added limiter diagnostics output in the checks panel and support bundle text.
+- Added limiter config persistence to normal config + preset save/load.
+
+## Previous Notes (v0.1.4)
 
 - You can now open multiple Roblox instances at the same time natively. StayActive closes the Roblox singleton lock automatically when Roblox starts.
 - Multi-instance startup is more reliable. If Roblox recreates the lock, StayActive retries quickly in the background.
 - Account detection is more accurate, so usernames and avatars are less likely to be mismatched between instances.
 - The app now gives clearer startup and cleanup logs, making it easier to see what happened if something fails.
-
-## Previous Notes
 
 - Added Theme Maker (create, preview, save, and delete custom color themes).
 - Added custom theme persistence in `stayactive_themes.json`.

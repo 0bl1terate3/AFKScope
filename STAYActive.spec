@@ -3,7 +3,7 @@ from PyInstaller.utils.hooks import collect_data_files
 from PyInstaller.utils.hooks import collect_dynamic_libs
 from PyInstaller.utils.hooks import collect_submodules
 
-datas = [('AFKSCOPE ICON.ico', '.')]
+datas = [('STAYACTIVE ICON.png', '.')]
 binaries = []
 hiddenimports = []
 datas += collect_data_files('vgamepad')
@@ -32,7 +32,7 @@ exe = EXE(
     a.binaries,
     a.datas,
     [],
-    name='AFKScope',
+    name='StayActive',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
@@ -45,5 +45,5 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
-    icon=['AFKSCOPE ICON.ico'],
+    uac_admin=True,
 )
