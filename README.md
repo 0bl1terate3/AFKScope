@@ -54,7 +54,7 @@
 - Sends anti-AFK jumps with focus spoofing (`All-at-once` and `Round-robin`).
 - Tracks identity + avatars and gives confidence labels for lookups.
 - Includes biome monitoring, rare-biome webhook alerts, and diagnostics export.
-- Ships with quality-of-life tools: window align/restore, presets, dark mode, tray support.
+- Ships with quality-of-life tools: window align/restore, presets, header theme dropdown, updater checks, and tray support.
 
 <table>
   <tr>
@@ -108,9 +108,14 @@ pip install pystray pillow
 - Multi-instance detection with enable/disable toggles per window.
 - Focus-spoofed jump dispatch via ViGEmBus + `vgamepad`.
 - Biome badge/history + rare biome Discord webhook alerts.
+- Header theme dropdown with many distinct color themes.
+- Smart anti-idle patterns: `balanced`, `subtle`, `aggressive`, `randomized`.
 - Identity detection from logs with Roblox API enrichment.
-- Session stats, watchdog reset, and safe pause schedule.
-- Config save/load, presets, JSON/CSV export, and debug bundle export.
+- Session stats, watchdog recovery sequence, and safe pause schedule.
+- In-app update checks + release page shortcut.
+- Config/preset validation improvements (pause schedule + webhook URL checks).
+- Config save/load, portable bundle import/export, JSON/CSV export, and debug bundle export.
+- Event timeline panel and copy-to-clipboard diagnostics utilities.
 
 ## Build EXE
 
@@ -133,7 +138,7 @@ Output: `dist/AFKScope.exe`
 
 - If the app process exists but no window appears:
   Ensure ViGEmBus is installed and running.
-  Use the latest release build (`v0.2.3+`) which includes startup/import fixes.
+  Use the latest release build (`v0.2.6+`) which includes startup/import fixes and QoL diagnostics improvements.
 - If PyInstaller hangs on Python 3.14:
   Build with Python 3.10 (`py -3.10`) as shown above.
 

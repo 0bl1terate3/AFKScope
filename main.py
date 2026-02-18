@@ -11,6 +11,7 @@ import sys
 import threading
 import time
 import tkinter as tk
+import webbrowser
 import zipfile
 from ctypes import wintypes
 from datetime import datetime
@@ -18,6 +19,7 @@ from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 from typing import Any, cast
 from urllib import error as urlerror
+from urllib import parse as urlparse
 from urllib import request as urlrequest
 
 vg: Any | None = None
@@ -98,7 +100,7 @@ BIOME_ALIAS_MAP: dict[str, str] = {
     "aurora": "AURORA",
 }
 
-APP_VERSION = "0.2.5"
+APP_VERSION = "0.2.6"
 APP_USER_AGENT = f"AFKScope/{APP_VERSION}"
 
 
@@ -154,6 +156,7 @@ class AntiAfkApp:
         self.biome_action_var = tk.StringVar(value="webhook")
         self.biome_action_preset_var = tk.StringVar(value="default")
         self.recovery_enabled_var = tk.BooleanVar(value=True)
+        self.latest_release_url = "https://github.com/0bl1terate3/AFKScope/releases/latest"
 
         self.window_map: list[tuple[int, str, int, str]] = []
         self._process_name_cache: dict[int, str] = {}
@@ -382,6 +385,7 @@ class AntiAfkApp:
         ttk.Button(preset_row, text="Load Preset", width=12, command=self.load_preset).pack(side=tk.LEFT, padx=(0, 5))
         ttk.Button(preset_row, text="Delete Preset", width=12, command=self.delete_preset).pack(side=tk.LEFT, padx=(0, 5))
         ttk.Button(preset_row, text="Refresh Presets", width=14, command=self._refresh_preset_list).pack(side=tk.LEFT)
+        ttk.Button(preset_row, text="Open Presets", width=12, command=self.open_presets_folder).pack(side=tk.LEFT, padx=(5, 0))
 
         options_group = ttk.LabelFrame(tab_control, text="Automation Options", padding=10)
         options_group.pack(fill="x", pady=(8, 0))
@@ -525,6 +529,8 @@ class AntiAfkApp:
         ttk.Button(diag_row, text="Run Checks", width=12, command=self.run_diagnostics_checks).pack(side=tk.LEFT, padx=(0, 5))
         ttk.Button(diag_row, text="Export Debug Bundle", width=18, command=self.export_debug_bundle).pack(side=tk.LEFT)
         ttk.Button(diag_row, text="Check Updates", width=13, command=self.check_for_updates).pack(side=tk.LEFT, padx=(5, 5))
+        ttk.Button(diag_row, text="Open Release", width=12, command=self.open_latest_release_page).pack(side=tk.LEFT, padx=(0, 5))
+        ttk.Button(diag_row, text="Copy Diag", width=10, command=self.copy_diagnostics_to_clipboard).pack(side=tk.LEFT, padx=(0, 5))
         ttk.Button(diag_row, text="Export Portable", width=14, command=self.export_portable_bundle).pack(side=tk.LEFT, padx=(0, 5))
         ttk.Button(diag_row, text="Import Portable", width=14, command=self.import_portable_bundle).pack(side=tk.LEFT)
         self.diagnostics_text = tk.Text(diag_group, height=5, font=("Consolas", 9), state=tk.DISABLED)
@@ -881,6 +887,47 @@ class AntiAfkApp:
         if value < 1:
             raise ValueError("Watchdog threshold must be >= 1.")
         return value
+
+    @staticmethod
+    def _parse_hhmm(raw: str, label: str) -> tuple[int, int]:
+        text = raw.strip()
+        parts = text.split(":")
+        if len(parts) != 2:
+            raise ValueError(f"{label} must be HH:MM (24-hour).")
+        try:
+            hour = int(parts[0])
+            minute = int(parts[1])
+        except ValueError as exc:
+            raise ValueError(f"{label} must be HH:MM (24-hour).") from exc
+        if not (0 <= hour <= 23 and 0 <= minute <= 59):
+            raise ValueError(f"{label} must be a valid 24-hour time.")
+        return hour, minute
+
+    def _validate_pause_schedule(self) -> None:
+        if not self.pause_enabled_var.get():
+            return
+        start_hour, start_min = self._parse_hhmm(self.pause_start_var.get(), "Pause start")
+        end_hour, end_min = self._parse_hhmm(self.pause_end_var.get(), "Pause end")
+        if start_hour == end_hour and start_min == end_min:
+            raise ValueError("Pause start and end cannot be identical.")
+
+    @staticmethod
+    def _is_valid_webhook_url(url: str) -> bool:
+        parsed = urlparse.urlparse(url.strip())
+        if parsed.scheme.lower() != "https":
+            return False
+        return bool(parsed.netloc and parsed.path)
+
+    def validate_runtime_settings(self) -> None:
+        self.parse_interval()
+        self.parse_watchdog_threshold()
+        self._validate_pause_schedule()
+        if self.webhook_enabled_var.get():
+            url = self.webhook_url_var.get().strip()
+            if not url:
+                raise ValueError("Webhook is enabled but URL is empty.")
+            if not self._is_valid_webhook_url(url):
+                raise ValueError("Webhook URL must be a valid HTTPS URL.")
 
     def _ensure_vgamepad_module(self) -> Any:
         global vg, vg_import_error, vg_import_attempted
@@ -1439,10 +1486,8 @@ class AntiAfkApp:
         if not self.pause_enabled_var.get():
             return False
         try:
-            start_str = self.pause_start_var.get().strip()
-            end_str = self.pause_end_var.get().strip()
-            start_hour, start_min = [int(x) for x in start_str.split(":")]
-            end_hour, end_min = [int(x) for x in end_str.split(":")]
+            start_hour, start_min = self._parse_hhmm(self.pause_start_var.get(), "Pause start")
+            end_hour, end_min = self._parse_hhmm(self.pause_end_var.get(), "Pause end")
         except Exception:
             return False
 
@@ -1607,8 +1652,8 @@ class AntiAfkApp:
             return
 
         try:
+            self.validate_runtime_settings()
             interval = self.parse_interval()
-            self.parse_watchdog_threshold()
             self.refresh_instance_list(manual=False)
             self.ensure_gamepad()
         except Exception as exc:
@@ -1797,6 +1842,15 @@ class AntiAfkApp:
         windows = self.find_roblox_windows()
         latest_log = self._find_latest_biome_log() or "none"
         webhook_on = self.webhook_enabled_var.get() and bool(self.webhook_url_var.get().strip())
+        try:
+            self._validate_pause_schedule()
+            pause_validation = "OK"
+        except Exception as exc:
+            pause_validation = f"INVALID ({exc})"
+        webhook_validation = "OK"
+        webhook_url = self.webhook_url_var.get().strip()
+        if self.webhook_enabled_var.get():
+            webhook_validation = "OK" if self._is_valid_webhook_url(webhook_url) else "INVALID (must be HTTPS URL)"
         checks = [
             f"AFKScope version: {APP_VERSION}",
             f"Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
@@ -1809,8 +1863,11 @@ class AntiAfkApp:
             f"Anti-idle pattern: {self.anti_idle_pattern_var.get()}",
             f"Recovery sequence: {'ON' if self.recovery_enabled_var.get() else 'OFF'}",
             f"Webhook configured: {'YES' if webhook_on else 'NO'}",
+            f"Webhook URL validation: {webhook_validation}",
+            f"Pause schedule validation: {pause_validation}",
             f"Rare biome alerts: {'ON' if self.biome_alerts_enabled_var.get() else 'OFF'} ({self.rare_biome_var.get().strip().upper() or 'GLITCHED'})",
             f"Rare biome action: {self.biome_action_var.get()} ({self.biome_action_preset_var.get().strip() or 'default'})",
+            f"Latest release URL: {self.latest_release_url}",
             f"Session errors: {self.session_errors}",
         ]
         body = "\n".join(checks)
@@ -1915,6 +1972,52 @@ class AntiAfkApp:
             writer.writerows(rows)
         self.log(f"Exported CSV: {path}")
 
+    @staticmethod
+    def _parse_version_parts(tag: str) -> tuple[int, int, int]:
+        numbers = re.findall(r"\d+", tag)
+        if not numbers:
+            return (0, 0, 0)
+        parts = [int(n) for n in numbers[:3]]
+        while len(parts) < 3:
+            parts.append(0)
+        return parts[0], parts[1], parts[2]
+
+    def open_presets_folder(self) -> None:
+        os.makedirs(self.presets_dir, exist_ok=True)
+        try:
+            if os.name == "nt":
+                os.startfile(self.presets_dir)  # type: ignore[attr-defined]
+            else:
+                webbrowser.open(f"file://{self.presets_dir}")
+            self._record_event("Opened presets folder")
+        except Exception as exc:
+            messagebox.showerror("Open presets folder failed", str(exc))
+
+    def copy_diagnostics_to_clipboard(self) -> None:
+        text = self.diagnostics_text.get("1.0", tk.END).strip()
+        if not text:
+            self.run_diagnostics_checks()
+            text = self.diagnostics_text.get("1.0", tk.END).strip()
+        if not text:
+            messagebox.showinfo("Diagnostics", "No diagnostics text available.")
+            return
+        try:
+            self.root.clipboard_clear()
+            self.root.clipboard_append(text)
+            self.root.update()
+            self.log("Diagnostics copied to clipboard.")
+            self._record_event("Diagnostics copied")
+        except Exception as exc:
+            messagebox.showerror("Copy diagnostics failed", str(exc))
+
+    def open_latest_release_page(self) -> None:
+        target = self.latest_release_url or "https://github.com/0bl1terate3/AFKScope/releases/latest"
+        opened = webbrowser.open(target)
+        if opened:
+            self._record_event("Opened release page")
+        else:
+            messagebox.showinfo("Release page", target)
+
     def check_for_updates(self) -> None:
         release = self._fetch_json("https://api.github.com/repos/0bl1terate3/AFKScope/releases/latest")
         if not release:
@@ -1922,15 +2025,39 @@ class AntiAfkApp:
             return
         tag = str(release.get("tag_name", "")).strip()
         url = str(release.get("html_url", "")).strip()
+        body = str(release.get("body", "") or "").strip()
+        if url:
+            self.latest_release_url = url
         if not tag:
             messagebox.showinfo("Updates", "Latest release tag was not found.")
             return
-        if tag.lstrip("v") == APP_VERSION:
-            messagebox.showinfo("Updates", f"You're up to date ({APP_VERSION}).")
+
+        latest = self._parse_version_parts(tag)
+        current = self._parse_version_parts(APP_VERSION)
+        snippet = ""
+        if body:
+            for line in body.splitlines():
+                s = line.strip()
+                if s:
+                    snippet = s
+                    break
+        if snippet:
+            snippet = f"\n\nNotes: {snippet[:180]}"
+
+        if latest == current:
+            messagebox.showinfo("Updates", f"You're up to date ({APP_VERSION}).{snippet}")
             self._record_event("Update check: up to date")
             return
+        if latest < current:
+            messagebox.showinfo(
+                "Updates",
+                f"You're on a newer local build (v{APP_VERSION}) than latest release ({tag}).\n\n{url}",
+            )
+            self._record_event(f"Update check: local ahead of {tag}")
+            return
+
         self._record_event(f"Update available: {tag}")
-        messagebox.showinfo("Update Available", f"Latest: {tag}\nCurrent: v{APP_VERSION}\n\n{url}")
+        messagebox.showinfo("Update Available", f"Latest: {tag}\nCurrent: v{APP_VERSION}\n\n{url}{snippet}")
 
     def export_portable_bundle(self) -> None:
         stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
