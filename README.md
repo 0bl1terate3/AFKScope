@@ -2,7 +2,7 @@
 
 AFKScope is a Windows desktop macro for Sol's RNG that sends timed virtual controller jumps through `vgamepad` + ViGEmBus.
 
-![AFKScope UI](assets/afkscope-ui.png)
+![AFKScope UI](assets/afkscope-ui-v2.png)
 
 ## Features
 
@@ -52,3 +52,4 @@ python -m PyInstaller --noconfirm --clean --onefile --windowed --name AFKScope -
 ## Release
 
 Current release target: `v0.1` with `dist/AFKScope.exe`.
+
