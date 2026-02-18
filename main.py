@@ -277,7 +277,19 @@ class AntiAfkApp:
             text="ViGEm focus spoofing macro with identity mapping, watchdog, and export tools",
         ).pack(anchor="center", pady=(2, 0))
 
-        controls_group = ttk.LabelFrame(container, text="Main Controls", padding=10)
+        notebook = ttk.Notebook(container)
+        notebook.pack(fill="both", expand=True)
+
+        tab_control = ttk.Frame(notebook, padding=10)
+        tab_instances = ttk.Frame(notebook, padding=10)
+        tab_monitor = ttk.Frame(notebook, padding=10)
+        tab_log = ttk.Frame(notebook, padding=10)
+        notebook.add(tab_control, text="Controls")
+        notebook.add(tab_instances, text="Instances")
+        notebook.add(tab_monitor, text="Monitor")
+        notebook.add(tab_log, text="Log")
+
+        controls_group = ttk.LabelFrame(tab_control, text="Main Controls", padding=10)
         controls_group.pack(fill="x")
 
         row1 = ttk.Frame(controls_group)
@@ -326,7 +338,7 @@ class AntiAfkApp:
         ttk.Button(preset_row, text="Delete Preset", width=12, command=self.delete_preset).pack(side=tk.LEFT, padx=(0, 5))
         ttk.Button(preset_row, text="Refresh Presets", width=14, command=self._refresh_preset_list).pack(side=tk.LEFT)
 
-        options_group = ttk.LabelFrame(container, text="Automation Options", padding=10)
+        options_group = ttk.LabelFrame(tab_control, text="Automation Options", padding=10)
         options_group.pack(fill="x", pady=(8, 0))
 
         opt1 = ttk.Frame(options_group)
@@ -376,12 +388,12 @@ class AntiAfkApp:
         )
         self.rare_biome_combo.pack(side=tk.LEFT)
 
-        history_group = ttk.LabelFrame(container, text="Biome Alert History", padding=8)
+        history_group = ttk.LabelFrame(tab_monitor, text="Biome Alert History", padding=8)
         history_group.pack(fill="x", pady=(8, 0))
         self.biome_history_list = tk.Listbox(history_group, height=4)
         self.biome_history_list.pack(fill="x")
 
-        target_group = ttk.LabelFrame(container, text="Per Instance Controls", padding=10)
+        target_group = ttk.LabelFrame(tab_instances, text="Per Instance Controls", padding=10)
         target_group.pack(fill="both", expand=True, pady=(8, 0))
 
         target_top = ttk.Frame(target_group)
@@ -420,16 +432,16 @@ class AntiAfkApp:
         tree_scroll.pack(side=tk.RIGHT, fill="y")
         self.instance_tree.configure(yscrollcommand=tree_scroll.set)
 
-        status_frame = ttk.LabelFrame(container, text="Session Stats", padding=10)
+        status_frame = ttk.LabelFrame(tab_monitor, text="Session Stats", padding=10)
         status_frame.pack(fill="x", pady=(8, 0))
         ttk.Label(status_frame, textvariable=self.stats_var).pack(anchor="w")
 
-        health_group = ttk.LabelFrame(container, text="Instance Health Panel", padding=10)
+        health_group = ttk.LabelFrame(tab_monitor, text="Instance Health Panel", padding=10)
         health_group.pack(fill="x", pady=(8, 0))
         self.health_text = tk.Text(health_group, height=4, font=("Consolas", 9), state=tk.DISABLED)
         self.health_text.pack(fill="x")
 
-        diag_group = ttk.LabelFrame(container, text="Diagnostics", padding=10)
+        diag_group = ttk.LabelFrame(tab_monitor, text="Diagnostics", padding=10)
         diag_group.pack(fill="x", pady=(8, 0))
         diag_row = ttk.Frame(diag_group)
         diag_row.pack(fill="x", pady=(0, 6))
@@ -438,12 +450,12 @@ class AntiAfkApp:
         self.diagnostics_text = tk.Text(diag_group, height=5, font=("Consolas", 9), state=tk.DISABLED)
         self.diagnostics_text.pack(fill="x")
 
-        status_row = ttk.Frame(container)
+        status_row = ttk.Frame(tab_log)
         status_row.pack(fill="x", pady=(8, 4))
         ttk.Label(status_row, text="Status:").pack(side=tk.LEFT)
         ttk.Label(status_row, textvariable=self.status_var).pack(side=tk.LEFT, padx=(6, 0))
 
-        log_group = ttk.LabelFrame(container, text="Log", padding=6)
+        log_group = ttk.LabelFrame(tab_log, text="Application Log", padding=6)
         log_group.pack(fill="both", expand=True)
         self.log_box = tk.Text(log_group, height=8, font=("Consolas", 9), state=tk.DISABLED)
         self.log_box.pack(fill="both", expand=True)
