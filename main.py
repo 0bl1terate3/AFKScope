@@ -19,12 +19,30 @@ from typing import Any, cast
 from urllib import error as urlerror
 from urllib import request as urlrequest
 
-try:
-    import vgamepad as vg
-    vg_import_error: Exception | None = None
-except Exception as exc:
-    vg = None
-    vg_import_error = exc
+vg: Any | None = None
+vg_import_error: Exception | None = None
+vg_import_attempted = False
+
+
+def _import_vgamepad_safely() -> tuple[Any | None, Exception | None]:
+    """Import vgamepad without blocking GUI startup on problematic WMI probes."""
+    try:
+        if os.name == "nt":
+            import platform
+
+            # Python 3.14 on some Windows installs can stall in platform.system()
+            # due to WMI probing; vgamepad calls platform.system() during import.
+            try:
+                if getattr(platform, "_wmi", None) is not None:
+                    platform._wmi = None
+            except Exception:
+                pass
+
+        import vgamepad as vg_module
+
+        return vg_module, None
+    except Exception as exc:
+        return None, exc
 
 try:
     import pystray
@@ -78,6 +96,9 @@ BIOME_ALIAS_MAP: dict[str, str] = {
     "bloodrain": "BLOOD RAIN",
     "aurora": "AURORA",
 }
+
+APP_VERSION = "0.2.3"
+APP_USER_AGENT = f"AFKScope/{APP_VERSION}"
 
 
 class AntiAfkApp:
@@ -245,10 +266,31 @@ class AntiAfkApp:
         os.makedirs(self.presets_dir, exist_ok=True)
         self._refresh_preset_list()
         self.load_config(silent=True)
-        self.refresh_instance_list(manual=False)
-        self.run_diagnostics_checks()
-        self._schedule_stats_update()
-        self._schedule_instance_poll()
+        self._ensure_window_visible()
+        self.root.after(50, self._finish_startup)
+
+    def _ensure_window_visible(self) -> None:
+        # Force the main window to appear in front if Windows restores it hidden/off-screen.
+        try:
+            self.root.update_idletasks()
+            self.root.state("normal")
+            self.root.deiconify()
+            self.root.lift()
+            self.root.attributes("-topmost", True)
+            self.root.after(250, lambda: self.root.attributes("-topmost", False))
+            self.root.focus_force()
+        except Exception:
+            pass
+
+    def _finish_startup(self) -> None:
+        # Defer startup work so the UI appears even if environment checks are slow.
+        try:
+            self.refresh_instance_list(manual=False)
+            self.run_diagnostics_checks()
+            self._schedule_stats_update()
+            self._schedule_instance_poll()
+        except Exception as exc:
+            self.log(f"Startup checks failed: {exc}")
 
     def _build_ui(self) -> None:
         self.style = ttk.Style()
@@ -775,7 +817,7 @@ class AntiAfkApp:
             req = urlrequest.Request(
                 url,
                 data=data,
-                headers={"Content-Type": "application/json", "User-Agent": "AFKScope/1.0"},
+                headers={"Content-Type": "application/json", "User-Agent": APP_USER_AGENT},
                 method="POST",
             )
             try:
@@ -818,14 +860,32 @@ class AntiAfkApp:
             raise ValueError("Watchdog threshold must be >= 1.")
         return value
 
-    def ensure_gamepad(self) -> None:
+    def _ensure_vgamepad_module(self) -> Any:
+        global vg, vg_import_error, vg_import_attempted
+
+        if vg is None and not vg_import_attempted:
+            vg_import_attempted = True
+            vg, vg_import_error = _import_vgamepad_safely()
+
         if vg is None:
             extra = f" ({vg_import_error})" if vg_import_error else ""
             raise RuntimeError(
                 "vgamepad/ViGEmClient failed to load. Reinstall ViGEmBus and rebuild with collected binaries"
                 + extra
             )
-        vg_module = cast(Any, vg)
+        return vg
+
+    def _vgamepad_status(self) -> str:
+        if vg is not None:
+            return "OK"
+        if not vg_import_attempted:
+            return "NOT LOADED (lazy)"
+        if vg_import_error:
+            return f"FAIL ({vg_import_error})"
+        return "FAIL"
+
+    def ensure_gamepad(self) -> None:
+        vg_module = cast(Any, self._ensure_vgamepad_module())
         if self.gamepad is None:
             self.gamepad = vg_module.VX360Gamepad()
 
@@ -966,7 +1026,7 @@ class AntiAfkApp:
 
     @staticmethod
     def _fetch_json(url: str, method: str = "GET", body: bytes | None = None) -> dict[str, Any] | None:
-        headers = {"User-Agent": "AFKScope/1.0"}
+        headers = {"User-Agent": APP_USER_AGENT}
         if method == "POST":
             headers["Content-Type"] = "application/json"
         req = urlrequest.Request(url, data=body, headers=headers, method=method)
@@ -1011,7 +1071,7 @@ class AntiAfkApp:
         image_url = first.get("imageUrl")
         if not isinstance(image_url, str) or not image_url:
             return None
-        req = urlrequest.Request(image_url, headers={"User-Agent": "AFKScope/1.0"})
+        req = urlrequest.Request(image_url, headers={"User-Agent": APP_USER_AGENT})
         try:
             with urlrequest.urlopen(req, timeout=10) as resp:
                 return resp.read()
@@ -1399,7 +1459,7 @@ class AntiAfkApp:
             return False
 
         self.ensure_gamepad()
-        vg_module = cast(Any, vg)
+        vg_module = cast(Any, self._ensure_vgamepad_module())
         gamepad = self.gamepad
         if gamepad is None:
             raise RuntimeError("Virtual gamepad is not initialized.")
@@ -1664,8 +1724,9 @@ class AntiAfkApp:
         latest_log = self._find_latest_biome_log() or "none"
         webhook_on = self.webhook_enabled_var.get() and bool(self.webhook_url_var.get().strip())
         checks = [
+            f"AFKScope version: {APP_VERSION}",
             f"Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
-            f"vgamepad import: {'OK' if vg is not None else f'FAIL ({vg_import_error})'}",
+            f"vgamepad import: {self._vgamepad_status()}",
             f"Gamepad session: {'READY' if self.gamepad is not None else 'NOT INITIALIZED'}",
             f"Roblox windows detected: {len(windows)}",
             f"Biome log source: {latest_log}",
