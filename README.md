@@ -109,13 +109,23 @@ pip install pystray pillow
 - Focus-spoofed jump dispatch via ViGEmBus + `vgamepad`.
 - Biome badge/history + rare biome Discord webhook alerts.
 - Header theme dropdown with many distinct color themes.
+- In-app Theme Maker with custom theme save/delete and live preview.
 - Smart anti-idle patterns: `balanced`, `subtle`, `aggressive`, `randomized`.
 - Identity detection from logs with Roblox API enrichment.
 - Session stats, watchdog recovery sequence, and safe pause schedule.
 - In-app update checks + release page shortcut.
 - Config/preset validation improvements (pause schedule + webhook URL checks).
 - Config save/load, portable bundle import/export, JSON/CSV export, and debug bundle export.
+- Dedicated AFKScope header logo for clearer branding/readability.
 - Event timeline panel and copy-to-clipboard diagnostics utilities.
+
+## Patch Notes (v0.2.7)
+
+- Added Theme Maker (create, preview, save, and delete custom color themes).
+- Added custom theme persistence in `afkscope_themes.json`.
+- Added dedicated header logo asset for improved header clarity.
+- Included custom themes in portable export/import and debug bundle exports.
+- Added AFKScope wiki-ready page content (`afkscopepage.md`) and macro list update (`macros.md`).
 
 ## Build EXE
 
@@ -123,13 +133,13 @@ Fast path (recommended):
 
 ```powershell
 py -3.10 -m pip install --upgrade pyinstaller vgamepad pystray pillow
-py -3.10 -m PyInstaller --noconfirm --onefile --windowed --name AFKScope --icon "AFKSCOPE ICON.ico" --add-data "AFKSCOPE ICON.ico;." --collect-binaries vgamepad --collect-data vgamepad --collect-submodules vgamepad main.py
+py -3.10 -m PyInstaller --noconfirm --onefile --windowed --name AFKScope --icon "AFKSCOPE ICON.ico" --add-data "AFKSCOPE ICON.ico;." --add-data "assets/afkscope-header-logo.png;assets" --collect-binaries vgamepad --collect-data vgamepad --collect-submodules vgamepad main.py
 ```
 
 Standard path:
 
 ```powershell
-python -m PyInstaller --noconfirm --onefile --windowed --name AFKScope --icon "AFKSCOPE ICON.ico" --add-data "AFKSCOPE ICON.ico;." --collect-binaries vgamepad --collect-data vgamepad --collect-submodules vgamepad main.py
+python -m PyInstaller --noconfirm --onefile --windowed --name AFKScope --icon "AFKSCOPE ICON.ico" --add-data "AFKSCOPE ICON.ico;." --add-data "assets/afkscope-header-logo.png;assets" --collect-binaries vgamepad --collect-data vgamepad --collect-submodules vgamepad main.py
 ```
 
 Output: `dist/AFKScope.exe`
@@ -138,7 +148,7 @@ Output: `dist/AFKScope.exe`
 
 - If the app process exists but no window appears:
   Ensure ViGEmBus is installed and running.
-  Use the latest release build (`v0.2.6+`) which includes startup/import fixes and QoL diagnostics improvements.
+  Use the latest release build (`v0.2.7+`) which includes startup/import fixes and QoL diagnostics improvements.
 - If PyInstaller hangs on Python 3.14:
   Build with Python 3.10 (`py -3.10`) as shown above.
 

@@ -16,7 +16,7 @@ import zipfile
 from ctypes import wintypes
 from datetime import datetime
 from pathlib import Path
-from tkinter import filedialog, messagebox, ttk
+from tkinter import colorchooser, filedialog, messagebox, ttk
 from typing import Any, cast
 from urllib import error as urlerror
 from urllib import parse as urlparse
@@ -100,14 +100,18 @@ BIOME_ALIAS_MAP: dict[str, str] = {
     "aurora": "AURORA",
 }
 
-APP_VERSION = "0.2.6"
+APP_VERSION = "0.2.7"
 APP_USER_AGENT = f"AFKScope/{APP_VERSION}"
+THEME_COLOR_KEYS = ("bg", "panel", "field", "text", "muted", "accent", "tree_sel", "tree_selfg")
 
 
 class AntiAfkApp:
     @staticmethod
     def _resource_path(relative_name: str) -> str:
-        base_path = getattr(sys, "_MEIPASS", os.getcwd())
+        if hasattr(sys, "_MEIPASS"):
+            base_path = getattr(sys, "_MEIPASS")
+        else:
+            base_path = os.path.dirname(os.path.abspath(__file__))
         return os.path.join(base_path, relative_name)
 
     def __init__(self, root: tk.Tk) -> None:
@@ -127,10 +131,17 @@ class AntiAfkApp:
         self.worker_thread: threading.Thread | None = None
         self.stop_event = threading.Event()
         self.metrics_lock = threading.Lock()
+        self.header_logo_photo: tk.PhotoImage | None = None
+        self.header_logo_label: tk.Label | None = None
+        self.header_icon_photo: Any | None = None
+        self.header_icon_badge: tk.Label | None = None
+        self.header_title_label: tk.Label | None = None
+        self.header_subtitle_label: tk.Label | None = None
 
         self.is_running = False
         self.gamepad: Any | None = None
         self.config_path = os.path.join(os.getcwd(), "afkscope_config.json")
+        self.theme_config_path = os.path.join(os.getcwd(), "afkscope_themes.json")
         self.presets_dir = os.path.join(os.getcwd(), "presets")
 
         self.interval_var = tk.StringVar(value="5")
@@ -201,6 +212,13 @@ class AntiAfkApp:
             "Arctic Ice": {"bg": "#edf6fb", "panel": "#deedf6", "field": "#f7fcff", "text": "#173247", "muted": "#5c7a8f", "accent": "#1999d6", "tree_sel": "#1999d6", "tree_selfg": "#ffffff"},
             "Obsidian Gold": {"bg": "#141414", "panel": "#1e1e1e", "field": "#252525", "text": "#f7f1df", "muted": "#b5aa89", "accent": "#d4a72c", "tree_sel": "#80641a", "tree_selfg": "#ffffff"},
         }
+        self.default_theme_order = list(self.theme_palettes.keys())
+        self.default_theme_names = set(self.default_theme_order)
+        self.custom_theme_palettes: dict[str, dict[str, str]] = {}
+        self.theme_maker_window: tk.Toplevel | None = None
+        self.theme_maker_name_var: tk.StringVar | None = None
+        self.theme_maker_color_vars: dict[str, tk.StringVar] = {}
+        self.theme_maker_swatches: dict[str, tk.Label] = {}
         self.current_palette = dict(self.theme_palettes[self.current_theme_name])
 
         self.username_patterns = [
@@ -262,6 +280,7 @@ class AntiAfkApp:
         ] 
 
         self._build_ui()
+        self._load_custom_themes()
         self._apply_selected_theme()
         self._render_biome_badge()
         os.makedirs(self.presets_dir, exist_ok=True)
@@ -319,11 +338,77 @@ class AntiAfkApp:
         )
         self.theme_combo.pack(side=tk.LEFT)
         self.theme_combo.bind("<<ComboboxSelected>>", self.on_theme_selected)
-        ttk.Label(header, text="AFKScope", font=("Segoe UI", 12, "bold")).pack(anchor="center")
-        ttk.Label(
+        ttk.Button(header_theme, text="Theme Maker", width=12, command=self.open_theme_maker).pack(side=tk.LEFT, padx=(6, 0))
+        title_row = ttk.Frame(header)
+        title_row.pack(anchor="center")
+        try:
+            logo_path = self._resource_path(os.path.join("assets", "afkscope-header-logo.png"))
+            self.header_logo_photo = tk.PhotoImage(file=logo_path)
+        except Exception:
+            self.header_logo_photo = None
+
+        if self.header_logo_photo is not None:
+            self.header_logo_label = tk.Label(
+                title_row,
+                image=self.header_logo_photo,
+                bd=0,
+                highlightthickness=0,
+            )
+            self.header_logo_label.pack(side=tk.LEFT)
+        else:
+            try:
+                from PIL import Image as PilImage
+                from PIL import ImageTk
+
+                icon_path = self._resource_path("AFKSCOPE ICON.ico")
+                with PilImage.open(icon_path) as pil_icon:
+                    pil_icon = pil_icon.convert("RGBA")
+                    bbox = pil_icon.getbbox()
+                    if bbox is not None:
+                        pil_icon = pil_icon.crop(bbox)
+                    resampling = getattr(PilImage, "Resampling", None)
+                    if resampling is not None:
+                        resample = cast(Any, resampling).LANCZOS
+                    else:
+                        resample = getattr(PilImage, "LANCZOS", 1)
+                    pil_icon.thumbnail((40, 40), cast(Any, resample))
+                    self.header_icon_photo = ImageTk.PhotoImage(pil_icon)
+            except Exception:
+                try:
+                    icon = tk.PhotoImage(file=self._resource_path("AFKSCOPE ICON.png"))
+                    if icon.width() > 40:
+                        step = max(1, icon.width() // 40)
+                        icon = cast(tk.PhotoImage, icon.subsample(step))
+                    self.header_icon_photo = icon
+                except Exception:
+                    self.header_icon_photo = None
+            if self.header_icon_photo is not None:
+                self.header_icon_badge = tk.Label(
+                    title_row,
+                    image=self.header_icon_photo,
+                    bg="#f5f8ff",
+                    bd=1,
+                    relief="solid",
+                    padx=3,
+                    pady=3,
+                    highlightthickness=1,
+                    highlightbackground="#7f8ea3",
+                )
+                self.header_icon_badge.pack(side=tk.LEFT, padx=(0, 8))
+            self.header_title_label = tk.Label(
+                title_row,
+                text="AFKScope",
+                font=("Segoe UI", 15, "bold"),
+                padx=0,
+                pady=0,
+            )
+            self.header_title_label.pack(side=tk.LEFT)
+        self.header_subtitle_label = tk.Label(
             header,
             text="ViGEm focus spoofing macro with identity mapping, watchdog, and export tools",
-        ).pack(anchor="center", pady=(2, 0))
+            font=("Segoe UI", 9, "normal"),
+        )
+        self.header_subtitle_label.pack(anchor="center", pady=(2, 0))
 
         notebook = ttk.Notebook(container)
         notebook.pack(fill="both", expand=True)
@@ -571,6 +656,289 @@ class AntiAfkApp:
     def _rgb_to_hex(rgb: tuple[int, int, int]) -> str:
         return f"#{rgb[0]:02x}{rgb[1]:02x}{rgb[2]:02x}"
 
+    @staticmethod
+    def _is_valid_theme_color(value: str) -> bool:
+        return re.fullmatch(r"#[0-9a-fA-F]{6}", value.strip()) is not None
+
+    @staticmethod
+    def _normalize_theme_name(raw_name: str) -> str:
+        name = re.sub(r"\s+", " ", raw_name.strip())
+        return name[:48]
+
+    def _normalize_theme_palette(self, raw_palette: Any) -> dict[str, str] | None:
+        if not isinstance(raw_palette, dict):
+            return None
+        normalized: dict[str, str] = {}
+        for key in THEME_COLOR_KEYS:
+            raw_value = raw_palette.get(key)
+            if not isinstance(raw_value, str):
+                return None
+            value = raw_value.strip().lower()
+            if not self._is_valid_theme_color(value):
+                return None
+            normalized[key] = value
+        return normalized
+
+    def _refresh_theme_combo_values(self) -> None:
+        custom_names = sorted(self.custom_theme_palettes.keys(), key=str.lower)
+        values = list(self.default_theme_order) + [name for name in custom_names if name not in self.default_theme_names]
+        if hasattr(self, "theme_combo"):
+            self.theme_combo.configure(values=values)
+
+    def _save_custom_themes(self) -> None:
+        if not self.custom_theme_palettes:
+            if os.path.exists(self.theme_config_path):
+                os.remove(self.theme_config_path)
+            return
+        payload = {name: self.custom_theme_palettes[name] for name in sorted(self.custom_theme_palettes, key=str.lower)}
+        with open(self.theme_config_path, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, indent=2)
+
+    def _load_custom_themes(self) -> None:
+        for theme_name in list(self.custom_theme_palettes.keys()):
+            self.theme_palettes.pop(theme_name, None)
+        self.custom_theme_palettes.clear()
+
+        if not os.path.exists(self.theme_config_path):
+            self._refresh_theme_combo_values()
+            return
+        try:
+            with open(self.theme_config_path, "r", encoding="utf-8") as handle:
+                raw_data = json.load(handle)
+        except Exception as exc:
+            self.log(f"Custom theme load skipped: {exc}")
+            self._refresh_theme_combo_values()
+            return
+
+        loaded = 0
+        skipped = 0
+        if isinstance(raw_data, dict):
+            for raw_name, raw_palette in raw_data.items():
+                if not isinstance(raw_name, str):
+                    skipped += 1
+                    continue
+                name = self._normalize_theme_name(raw_name)
+                if not name or name in self.default_theme_names:
+                    skipped += 1
+                    continue
+                palette = self._normalize_theme_palette(raw_palette)
+                if palette is None:
+                    skipped += 1
+                    continue
+                self.custom_theme_palettes[name] = palette
+                self.theme_palettes[name] = dict(palette)
+                loaded += 1
+        else:
+            skipped += 1
+
+        self._refresh_theme_combo_values()
+        if loaded > 0:
+            self.log(f"Loaded {loaded} custom theme(s).")
+        if skipped > 0:
+            noun = "entry" if skipped == 1 else "entries"
+            self.log(f"Skipped {skipped} invalid custom theme {noun}.")
+
+    def open_theme_maker(self) -> None:
+        if self.theme_maker_window is not None and self.theme_maker_window.winfo_exists():
+            self.theme_maker_window.lift()
+            self.theme_maker_window.focus_force()
+            return
+
+        window = tk.Toplevel(self.root)
+        self.theme_maker_window = window
+        window.title("Theme Maker")
+        window.geometry("650x360")
+        window.minsize(650, 360)
+        window.resizable(False, False)
+        window.transient(self.root)
+        window.protocol("WM_DELETE_WINDOW", self._theme_maker_on_close)
+
+        container = ttk.Frame(window, padding=10)
+        container.pack(fill="both", expand=True)
+
+        name_row = ttk.Frame(container)
+        name_row.pack(fill="x")
+        self.theme_maker_name_var = tk.StringVar(value=self.theme_name_var.get().strip() or "Custom Theme")
+        ttk.Label(name_row, text="Theme name:").pack(side=tk.LEFT)
+        ttk.Entry(name_row, textvariable=self.theme_maker_name_var, width=26).pack(side=tk.LEFT, padx=(8, 8))
+        ttk.Button(name_row, text="Load Current", width=12, command=self._theme_maker_load_current).pack(side=tk.LEFT, padx=(0, 4))
+        ttk.Button(name_row, text="Load Selected", width=12, command=self._theme_maker_load_selected).pack(side=tk.LEFT)
+
+        colors_group = ttk.LabelFrame(container, text="Palette Colors (#RRGGBB)", padding=8)
+        colors_group.pack(fill="x", pady=(10, 8))
+
+        self.theme_maker_color_vars = {}
+        self.theme_maker_swatches = {}
+        for idx, key in enumerate(THEME_COLOR_KEYS):
+            row = idx // 2
+            col = (idx % 2) * 4
+            ttk.Label(colors_group, text=f"{key}:").grid(row=row, column=col, sticky="w", padx=(0, 4), pady=4)
+            var = tk.StringVar(value=self.current_palette.get(key, "#000000"))
+            self.theme_maker_color_vars[key] = var
+            ttk.Entry(colors_group, textvariable=var, width=10, justify="center").grid(row=row, column=col + 1, sticky="w", padx=(0, 4))
+            ttk.Button(colors_group, text="Pick", width=6, command=lambda k=key: self._theme_maker_pick_color(k)).grid(
+                row=row,
+                column=col + 2,
+                sticky="w",
+                padx=(0, 4),
+            )
+            swatch = tk.Label(colors_group, text="    ", relief="solid", borderwidth=1)
+            swatch.grid(row=row, column=col + 3, sticky="w")
+            self.theme_maker_swatches[key] = swatch
+            var.trace_add("write", lambda *_args, k=key: self._theme_maker_update_swatch(k))
+
+        button_row = ttk.Frame(container)
+        button_row.pack(fill="x", pady=(2, 0))
+        ttk.Button(button_row, text="Preview", width=12, command=self._theme_maker_preview).pack(side=tk.LEFT)
+        ttk.Button(button_row, text="Save Theme", width=12, command=self._theme_maker_save).pack(side=tk.LEFT, padx=(6, 0))
+        ttk.Button(button_row, text="Delete Theme", width=12, command=self._theme_maker_delete).pack(side=tk.LEFT, padx=(6, 0))
+        ttk.Button(button_row, text="Close", width=10, command=self._theme_maker_on_close).pack(side=tk.RIGHT)
+
+        ttk.Label(
+            container,
+            text="Built-in themes are read-only. Save a custom theme to add it to the dropdown.",
+        ).pack(anchor="w", pady=(8, 0))
+
+        self._theme_maker_update_all_swatches()
+        self._apply_theme(self.current_palette)
+
+    def _theme_maker_on_close(self) -> None:
+        if self.theme_maker_window is not None and self.theme_maker_window.winfo_exists():
+            self.theme_maker_window.destroy()
+        self.theme_maker_window = None
+        self.theme_maker_name_var = None
+        self.theme_maker_color_vars = {}
+        self.theme_maker_swatches = {}
+
+    def _theme_maker_load_current(self) -> None:
+        if self.theme_maker_name_var is not None:
+            self.theme_maker_name_var.set(self.theme_name_var.get().strip() or "Custom Theme")
+        for key in THEME_COLOR_KEYS:
+            var = self.theme_maker_color_vars.get(key)
+            if var is not None:
+                var.set(self.current_palette.get(key, "#000000"))
+        self._theme_maker_update_all_swatches()
+
+    def _theme_maker_load_selected(self) -> None:
+        selected = self.theme_name_var.get().strip()
+        palette = self.theme_palettes.get(selected)
+        if palette is None:
+            self._theme_maker_load_current()
+            return
+        if self.theme_maker_name_var is not None:
+            self.theme_maker_name_var.set(selected)
+        for key in THEME_COLOR_KEYS:
+            var = self.theme_maker_color_vars.get(key)
+            if var is not None:
+                var.set(palette.get(key, "#000000"))
+        self._theme_maker_update_all_swatches()
+
+    def _theme_maker_pick_color(self, key: str) -> None:
+        var = self.theme_maker_color_vars.get(key)
+        if var is None:
+            return
+        initial = var.get().strip() if self._is_valid_theme_color(var.get()) else self.current_palette.get(key, "#000000")
+        _rgb, picked = colorchooser.askcolor(color=initial, parent=self.theme_maker_window)
+        if picked:
+            var.set(picked.lower())
+            self._theme_maker_update_swatch(key)
+
+    def _theme_maker_update_swatch(self, key: str) -> None:
+        swatch = self.theme_maker_swatches.get(key)
+        var = self.theme_maker_color_vars.get(key)
+        if swatch is None or var is None:
+            return
+        value = var.get().strip()
+        if self._is_valid_theme_color(value):
+            swatch.configure(bg=value, fg=value, text="    ")
+        else:
+            swatch.configure(bg="#ff9b9b", fg="#ff9b9b", text=" !! ")
+
+    def _theme_maker_update_all_swatches(self) -> None:
+        for key in THEME_COLOR_KEYS:
+            self._theme_maker_update_swatch(key)
+
+    def _theme_maker_collect_palette(self) -> dict[str, str]:
+        palette: dict[str, str] = {}
+        invalid: list[str] = []
+        for key in THEME_COLOR_KEYS:
+            var = self.theme_maker_color_vars.get(key)
+            value = var.get().strip() if var is not None else ""
+            if not self._is_valid_theme_color(value):
+                invalid.append(key)
+                continue
+            palette[key] = value.lower()
+        if invalid:
+            raise ValueError(f"Invalid #RRGGBB value for: {', '.join(invalid)}")
+        return palette
+
+    def _theme_maker_preview(self) -> None:
+        try:
+            palette = self._theme_maker_collect_palette()
+        except ValueError as exc:
+            messagebox.showerror("Theme Maker", str(exc))
+            return
+        self.current_palette = dict(palette)
+        self._apply_theme(self.current_palette)
+        self.log("Theme maker preview applied.")
+
+    def _theme_maker_save(self) -> None:
+        raw_name = self.theme_maker_name_var.get() if self.theme_maker_name_var is not None else ""
+        name = self._normalize_theme_name(raw_name)
+        if not name:
+            messagebox.showerror("Theme Maker", "Theme name cannot be empty.")
+            return
+        existing_name = next((candidate for candidate in self.theme_palettes if candidate.lower() == name.lower()), None)
+        if existing_name in self.default_theme_names:
+            messagebox.showerror("Theme Maker", "Built-in themes are read-only. Choose a different name.")
+            return
+        if existing_name is not None:
+            name = existing_name
+
+        try:
+            palette = self._theme_maker_collect_palette()
+            self.custom_theme_palettes[name] = dict(palette)
+            self.theme_palettes[name] = dict(palette)
+            self._save_custom_themes()
+        except Exception as exc:
+            messagebox.showerror("Theme Maker", f"Could not save theme: {exc}")
+            return
+
+        self._refresh_theme_combo_values()
+        self.theme_name_var.set(name)
+        if self.theme_maker_name_var is not None:
+            self.theme_maker_name_var.set(name)
+        self._apply_selected_theme()
+        self.log(f"Theme saved: {name}")
+
+    def _theme_maker_delete(self) -> None:
+        raw_name = self.theme_maker_name_var.get() if self.theme_maker_name_var is not None else ""
+        name = self._normalize_theme_name(raw_name)
+        existing_name = next((candidate for candidate in self.custom_theme_palettes if candidate.lower() == name.lower()), None)
+        if existing_name is None:
+            messagebox.showinfo("Theme Maker", "Select a saved custom theme to delete.")
+            return
+        if not messagebox.askyesno("Theme Maker", f"Delete custom theme '{existing_name}'?"):
+            return
+
+        self.custom_theme_palettes.pop(existing_name, None)
+        self.theme_palettes.pop(existing_name, None)
+        try:
+            self._save_custom_themes()
+        except Exception as exc:
+            messagebox.showerror("Theme Maker", f"Could not update theme file: {exc}")
+            return
+
+        self._refresh_theme_combo_values()
+        fallback = "Midnight"
+        if self.theme_name_var.get().strip() == existing_name:
+            self.theme_name_var.set(fallback)
+            self._apply_selected_theme()
+        if self.theme_maker_name_var is not None:
+            self.theme_maker_name_var.set(self.theme_name_var.get().strip())
+        self._theme_maker_load_selected()
+        self.log(f"Theme deleted: {existing_name}")
+
     def _apply_selected_theme(self) -> None:
         name = self.theme_name_var.get().strip()
         palette = self.theme_palettes.get(name)
@@ -630,6 +998,17 @@ class AntiAfkApp:
             selectbackground=palette["tree_sel"],
             selectforeground=palette["tree_selfg"],
         )
+        if self.header_logo_label is not None:
+            self.header_logo_label.configure(bg=palette["bg"])
+        if self.header_title_label is not None:
+            self.header_title_label.configure(bg=palette["bg"], fg=palette["accent"])
+        if self.header_subtitle_label is not None:
+            self.header_subtitle_label.configure(bg=palette["bg"], fg=palette["muted"])
+        if self.header_icon_badge is not None:
+            self.header_icon_badge.configure(
+                bg=palette["field"],
+                highlightbackground=palette["accent"],
+            )
         if hasattr(self, "biome_badge"):
             self.biome_badge.configure(
                 highlightbackground=palette["panel"],
@@ -1900,6 +2279,8 @@ class AntiAfkApp:
                 zf.writestr("biome-history.txt", "\n".join(biome_history) + "\n")
                 if os.path.exists(self.config_path):
                     zf.write(self.config_path, arcname="afkscope_config.json")
+                if os.path.exists(self.theme_config_path):
+                    zf.write(self.theme_config_path, arcname="afkscope_themes.json")
                 latest_log = self._find_latest_biome_log()
                 if latest_log and os.path.exists(latest_log):
                     try:
@@ -2074,6 +2455,8 @@ class AntiAfkApp:
             with zipfile.ZipFile(path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
                 if os.path.exists(self.config_path):
                     zf.write(self.config_path, arcname="afkscope_config.json")
+                if os.path.exists(self.theme_config_path):
+                    zf.write(self.theme_config_path, arcname="afkscope_themes.json")
                 if os.path.isdir(self.presets_dir):
                     for name in os.listdir(self.presets_dir):
                         full = os.path.join(self.presets_dir, name)
@@ -2094,6 +2477,9 @@ class AntiAfkApp:
                 if "afkscope_config.json" in members:
                     with zf.open("afkscope_config.json") as src, open(self.config_path, "wb") as dst:
                         dst.write(src.read())
+                if "afkscope_themes.json" in members:
+                    with zf.open("afkscope_themes.json") as src, open(self.theme_config_path, "wb") as dst:
+                        dst.write(src.read())
                 os.makedirs(self.presets_dir, exist_ok=True)
                 for name in members:
                     normalized = name.replace("\\", "/")
@@ -2102,6 +2488,7 @@ class AntiAfkApp:
                         with zf.open(name) as src, open(target, "wb") as dst:
                             dst.write(src.read())
             self._refresh_preset_list()
+            self._load_custom_themes()
             self.load_config(silent=True)
             self.log(f"Portable bundle imported: {path}")
             self._record_event("Portable import completed")
@@ -2123,6 +2510,8 @@ class AntiAfkApp:
             "AFKSCOPE ICON.ico",
             "--add-data",
             "AFKSCOPE ICON.ico;.",
+            "--add-data",
+            "assets/afkscope-header-logo.png;assets",
             "--collect-binaries",
             "vgamepad",
             "--collect-data",
