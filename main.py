@@ -4,6 +4,7 @@ import ctypes
 import json
 import math
 import os
+import queue
 import random
 import re
 import subprocess
@@ -100,8 +101,11 @@ BIOME_ALIAS_MAP: dict[str, str] = {
     "aurora": "AURORA",
 }
 
-APP_VERSION = "0.2.8"
-APP_USER_AGENT = f"AFKScope/{APP_VERSION}"
+APP_VERSION = "0.1.1"
+APP_NAME = "StayActive"
+APP_USER_AGENT = f"{APP_NAME}/{APP_VERSION}"
+APP_ICON_ICO = "STAYACTIVE ICON.ico"
+APP_ICON_PNG = "STAYACTIVE ICON.png"
 THEME_COLOR_KEYS = ("bg", "panel", "field", "text", "muted", "accent", "tree_sel", "tree_selfg")
 WM_HOTKEY = 0x0312
 PM_REMOVE = 0x0001
@@ -120,12 +124,14 @@ class AntiAfkApp:
 
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
-        self.root.title("AFKScope - Sol's RNG Anti AFK")
+        self.root.title(f"{APP_NAME} - Sol's RNG Anti AFK")
         self.root.geometry("1220x940")
         self.root.minsize(1100, 820)
         self.root.resizable(True, True)
         try:
-            self.root.iconbitmap(self._resource_path("AFKSCOPE ICON.ico"))
+            icon_path = self._resource_path(APP_ICON_ICO)
+            if os.path.exists(icon_path):
+                self.root.iconbitmap(icon_path)
         except Exception:
             pass
 
@@ -144,10 +150,10 @@ class AntiAfkApp:
 
         self.is_running = False
         self.gamepad: Any | None = None
-        self.config_path = os.path.join(os.getcwd(), "afkscope_config.json")
-        self.theme_config_path = os.path.join(os.getcwd(), "afkscope_themes.json")
-        self.recovery_state_path = os.path.join(os.getcwd(), "afkscope_recovery_state.json")
-        self.recovery_snapshot_path = os.path.join(os.getcwd(), "afkscope_recovery_snapshot.json")
+        self.config_path = os.path.join(os.getcwd(), "stayactive_config.json")
+        self.theme_config_path = os.path.join(os.getcwd(), "stayactive_themes.json")
+        self.recovery_state_path = os.path.join(os.getcwd(), "stayactive_recovery_state.json")
+        self.recovery_snapshot_path = os.path.join(os.getcwd(), "stayactive_recovery_snapshot.json")
         self.presets_dir = os.path.join(os.getcwd(), "presets")
         self.should_offer_setup_wizard = not os.path.exists(self.config_path)
 
@@ -163,6 +169,17 @@ class AntiAfkApp:
         self.health_alert_minutes_var = tk.StringVar(value="3")
         self.autosave_enabled_var = tk.BooleanVar(value=True)
         self.autosave_minutes_var = tk.StringVar(value="2")
+        self.start_when_windows_found_var = tk.BooleanVar(value=True)
+        self.safe_mode_var = tk.BooleanVar(value=False)
+        self.manual_pause_minutes_var = tk.StringVar(value="10")
+        self.profile_hotkey_1_var = tk.StringVar(value="default")
+        self.profile_hotkey_2_var = tk.StringVar(value="farming")
+        self.profile_hotkey_3_var = tk.StringVar(value="overnight")
+        self.startup_restore_enabled_var = tk.BooleanVar(value=False)
+        self.startup_preset_var = tk.StringVar(value="default")
+        self.startup_auto_start_var = tk.BooleanVar(value=False)
+        self.startup_auto_align_var = tk.BooleanVar(value=False)
+        self.event_filter_var = tk.StringVar(value="all")
 
         self.pause_enabled_var = tk.BooleanVar(value=False)
         self.pause_start_var = tk.StringVar(value="02:00")
@@ -173,19 +190,28 @@ class AntiAfkApp:
 
         self.watchdog_enabled_var = tk.BooleanVar(value=True)
         self.watchdog_threshold_var = tk.StringVar(value="12")
+        self.watchdog_no_windows_threshold_var = tk.StringVar(value="24")
+        self.watchdog_jump_fail_threshold_var = tk.StringVar(value="8")
         self.preset_name_var = tk.StringVar(value="default")
         self.biome_alerts_enabled_var = tk.BooleanVar(value=False)
         self.rare_biome_var = tk.StringVar(value="GLITCHED")
         self.biome_action_var = tk.StringVar(value="webhook")
         self.biome_action_preset_var = tk.StringVar(value="default")
         self.recovery_enabled_var = tk.BooleanVar(value=True)
-        self.latest_release_url = "https://github.com/0bl1terate3/AFKScope/releases/latest"
+        self.latest_release_url = "https://github.com/0bl1terate3/StayActive/releases/latest"
 
         self.window_map: list[tuple[int, str, int, str]] = []
         self._process_name_cache: dict[int, str] = {}
         self.instance_enabled_by_hwnd: dict[int, bool] = {}
         self.loaded_enabled_by_pid: dict[int, bool] = {}
         self.instance_last_jump: dict[int, float] = {}
+        self.instance_interval_override: dict[int, float] = {}
+        self.instance_pattern_override: dict[int, str] = {}
+        self.instance_fail_count: dict[int, int] = {}
+        self.instance_attempt_count: dict[int, int] = {}
+        self.instance_quarantine_until: dict[int, float] = {}
+        self.instance_quarantine_fail_threshold = 6
+        self.instance_quarantine_seconds = 180
         self.enabled_by_username: dict[str, bool] = {}
 
         self.pid_username: dict[int, str] = {}
@@ -204,16 +230,23 @@ class AntiAfkApp:
         self.session_errors = 0
 
         self.failed_cycles = 0
+        self.no_window_cycles = 0
+        self.jump_fail_cycles = 0
         self.round_robin_index = 0
         self.last_instance_health_alert: dict[int, float] = {}
         self.last_autosave_at = 0.0
         self.recovery_prompt_needed = self._detect_unclean_shutdown()
         self.quick_setup_window: tk.Toplevel | None = None
+        self.waiting_for_windows = False
+        self.pause_override_until: float | None = None
+        self.last_not_due_log_at = 0.0
 
         self.tray_icon = None
         self.tray_enabled = False
         self.hotkey_actions: dict[int, tuple[str, Callable[[], None]]] = {}
         self.global_hotkeys_registered = False
+        self.webhook_queue: queue.Queue[tuple[str, str, int]] = queue.Queue()
+        self.webhook_worker_running = False
 
         self.current_theme_name = "Midnight"
         self.theme_palettes: dict[str, dict[str, str]] = {
@@ -238,6 +271,8 @@ class AntiAfkApp:
         self.theme_maker_color_vars: dict[str, tk.StringVar] = {}
         self.theme_maker_swatches: dict[str, tk.Label] = {}
         self.current_palette = dict(self.theme_palettes[self.current_theme_name])
+        self.instance_override_seconds_var: tk.StringVar | None = None
+        self.instance_override_pattern_var: tk.StringVar | None = None
 
         self.username_patterns = [
             re.compile(r'displayName["\s:]+([A-Za-z0-9_]{3,20})'),
@@ -330,6 +365,7 @@ class AntiAfkApp:
             self._schedule_stats_update()
             self._schedule_instance_poll()
             self._schedule_recovery_autosave()
+            self._apply_startup_restore()
             if self.recovery_prompt_needed:
                 self.log("Detected previous unclean shutdown state.")
                 self.root.after(250, self._prompt_recovery_restore)
@@ -337,6 +373,21 @@ class AntiAfkApp:
                 self.root.after(350, self.open_quick_setup_wizard)
         except Exception as exc:
             self.log(f"Startup checks failed: {exc}")
+
+    def _apply_startup_restore(self) -> None:
+        if not self.startup_restore_enabled_var.get():
+            return
+        preset_name = self._sanitize_preset_name(self.startup_preset_var.get().strip() or "default")
+        path = self._preset_path(preset_name)
+        if os.path.exists(path):
+            self.preset_name_var.set(preset_name)
+            self.load_preset()
+        else:
+            self.log(f"Startup restore preset not found: {preset_name}")
+        if self.startup_auto_align_var.get():
+            self.align_windows(log_result=False)
+        if self.startup_auto_start_var.get():
+            self.start()
 
     def _build_ui(self) -> None:
         self.style = ttk.Style()
@@ -367,11 +418,7 @@ class AntiAfkApp:
         ttk.Button(header_theme, text="Theme Maker", width=12, command=self.open_theme_maker).pack(side=tk.LEFT, padx=(6, 0))
         title_row = ttk.Frame(header)
         title_row.pack(anchor="center")
-        try:
-            logo_path = self._resource_path(os.path.join("assets", "afkscope-header-logo.png"))
-            self.header_logo_photo = tk.PhotoImage(file=logo_path)
-        except Exception:
-            self.header_logo_photo = None
+        self.header_logo_photo = None
 
         if self.header_logo_photo is not None:
             self.header_logo_label = tk.Label(
@@ -383,29 +430,34 @@ class AntiAfkApp:
             self.header_logo_label.pack(side=tk.LEFT)
         else:
             try:
-                from PIL import Image as PilImage
-                from PIL import ImageTk
-
-                icon_path = self._resource_path("AFKSCOPE ICON.ico")
-                with PilImage.open(icon_path) as pil_icon:
-                    pil_icon = pil_icon.convert("RGBA")
-                    bbox = pil_icon.getbbox()
-                    if bbox is not None:
-                        pil_icon = pil_icon.crop(bbox)
-                    resampling = getattr(PilImage, "Resampling", None)
-                    if resampling is not None:
-                        resample = cast(Any, resampling).LANCZOS
-                    else:
-                        resample = getattr(PilImage, "LANCZOS", 1)
-                    pil_icon.thumbnail((40, 40), cast(Any, resample))
-                    self.header_icon_photo = ImageTk.PhotoImage(pil_icon)
+                png_path = self._resource_path(APP_ICON_PNG)
+                if not os.path.exists(png_path):
+                    raise FileNotFoundError("No PNG icon resource available.")
+                icon = tk.PhotoImage(file=png_path)
+                if icon.width() > 40:
+                    step = max(1, icon.width() // 40)
+                    icon = cast(tk.PhotoImage, icon.subsample(step))
+                self.header_icon_photo = icon
             except Exception:
                 try:
-                    icon = tk.PhotoImage(file=self._resource_path("AFKSCOPE ICON.png"))
-                    if icon.width() > 40:
-                        step = max(1, icon.width() // 40)
-                        icon = cast(tk.PhotoImage, icon.subsample(step))
-                    self.header_icon_photo = icon
+                    from PIL import Image as PilImage
+                    from PIL import ImageTk
+
+                    icon_path = self._resource_path(APP_ICON_ICO)
+                    if not os.path.exists(icon_path):
+                        raise FileNotFoundError("No icon resource available.")
+                    with PilImage.open(icon_path) as pil_icon:
+                        pil_icon = pil_icon.convert("RGBA")
+                        bbox = pil_icon.getbbox()
+                        if bbox is not None:
+                            pil_icon = pil_icon.crop(bbox)
+                        resampling = getattr(PilImage, "Resampling", None)
+                        if resampling is not None:
+                            resample = cast(Any, resampling).LANCZOS
+                        else:
+                            resample = getattr(PilImage, "LANCZOS", 1)
+                        pil_icon.thumbnail((40, 40), cast(Any, resample))
+                        self.header_icon_photo = ImageTk.PhotoImage(pil_icon)
                 except Exception:
                     self.header_icon_photo = None
             if self.header_icon_photo is not None:
@@ -423,7 +475,7 @@ class AntiAfkApp:
                 self.header_icon_badge.pack(side=tk.LEFT, padx=(0, 8))
             self.header_title_label = tk.Label(
                 title_row,
-                text="AFKScope",
+                text=APP_NAME,
                 font=("Segoe UI", 15, "bold"),
                 padx=0,
                 pady=0,
@@ -516,9 +568,11 @@ class AntiAfkApp:
 
         opt3 = ttk.Frame(options_group)
         opt3.pack(fill="x", pady=(6, 0))
-        ttk.Checkbutton(opt3, text="Watchdog reset if no successful jumps", variable=self.watchdog_enabled_var).pack(side=tk.LEFT)
-        ttk.Label(opt3, text="Threshold cycles:").pack(side=tk.LEFT, padx=(10, 4))
-        ttk.Entry(opt3, textvariable=self.watchdog_threshold_var, width=5, justify="center").pack(side=tk.LEFT)
+        ttk.Checkbutton(opt3, text="Watchdog", variable=self.watchdog_enabled_var).pack(side=tk.LEFT)
+        ttk.Label(opt3, text="No windows cycles:").pack(side=tk.LEFT, padx=(10, 4))
+        ttk.Entry(opt3, textvariable=self.watchdog_no_windows_threshold_var, width=5, justify="center").pack(side=tk.LEFT)
+        ttk.Label(opt3, text="Jump-fail cycles:").pack(side=tk.LEFT, padx=(10, 4))
+        ttk.Entry(opt3, textvariable=self.watchdog_jump_fail_threshold_var, width=5, justify="center").pack(side=tk.LEFT)
         ttk.Checkbutton(opt3, text="Recovery sequence", variable=self.recovery_enabled_var).pack(side=tk.LEFT, padx=(12, 0))
 
         pattern_row = ttk.Frame(options_group)
@@ -537,10 +591,32 @@ class AntiAfkApp:
         hotkey_row.pack(fill="x", pady=(6, 0))
         ttk.Checkbutton(
             hotkey_row,
-            text="Global hotkeys (Ctrl+Alt+S/J/R/T)",
+            text="Global hotkeys (Ctrl+Alt+S/J/R/T/1/2/3)",
             variable=self.hotkeys_enabled_var,
             command=self.on_hotkeys_toggle,
         ).pack(side=tk.LEFT)
+
+        practical_row = ttk.Frame(options_group)
+        practical_row.pack(fill="x", pady=(6, 0))
+        ttk.Checkbutton(
+            practical_row,
+            text="Wait for Roblox windows before sending jumps",
+            variable=self.start_when_windows_found_var,
+        ).pack(side=tk.LEFT)
+        ttk.Checkbutton(
+            practical_row,
+            text="Safe mode (slower/more conservative)",
+            variable=self.safe_mode_var,
+        ).pack(side=tk.LEFT, padx=(12, 0))
+
+        pause_quick_row = ttk.Frame(options_group)
+        pause_quick_row.pack(fill="x", pady=(6, 0))
+        ttk.Label(pause_quick_row, text="Quick pause (minutes):").pack(side=tk.LEFT)
+        ttk.Entry(pause_quick_row, textvariable=self.manual_pause_minutes_var, width=5, justify="center").pack(
+            side=tk.LEFT, padx=(8, 6)
+        )
+        ttk.Button(pause_quick_row, text="Pause Now", width=10, command=self.pause_for_minutes).pack(side=tk.LEFT)
+        ttk.Button(pause_quick_row, text="Resume", width=10, command=self.clear_manual_pause).pack(side=tk.LEFT, padx=(6, 0))
 
         health_row = ttk.Frame(options_group)
         health_row.pack(fill="x", pady=(6, 0))
@@ -596,6 +672,34 @@ class AntiAfkApp:
         ttk.Label(action_row, text="Preset").pack(side=tk.LEFT)
         ttk.Entry(action_row, textvariable=self.biome_action_preset_var, width=16).pack(side=tk.LEFT, padx=(6, 0))
 
+        startup_row = ttk.Frame(options_group)
+        startup_row.pack(fill="x", pady=(8, 0))
+        ttk.Checkbutton(
+            startup_row,
+            text="Startup restore",
+            variable=self.startup_restore_enabled_var,
+        ).pack(side=tk.LEFT)
+        ttk.Label(startup_row, text="Preset:").pack(side=tk.LEFT, padx=(10, 4))
+        self.startup_preset_combo = ttk.Combobox(
+            startup_row,
+            textvariable=self.startup_preset_var,
+            width=16,
+            state="normal",
+        )
+        self.startup_preset_combo.pack(side=tk.LEFT)
+        ttk.Checkbutton(startup_row, text="Auto-start", variable=self.startup_auto_start_var).pack(side=tk.LEFT, padx=(10, 0))
+        ttk.Checkbutton(startup_row, text="Auto-align", variable=self.startup_auto_align_var).pack(side=tk.LEFT, padx=(8, 0))
+
+        quick_profiles_row = ttk.Frame(options_group)
+        quick_profiles_row.pack(fill="x", pady=(6, 0))
+        ttk.Label(quick_profiles_row, text="Hotkey profiles Ctrl+Alt+1/2/3:").pack(side=tk.LEFT)
+        self.profile_hotkey_1_entry = ttk.Entry(quick_profiles_row, textvariable=self.profile_hotkey_1_var, width=12)
+        self.profile_hotkey_1_entry.pack(side=tk.LEFT, padx=(8, 4))
+        self.profile_hotkey_2_entry = ttk.Entry(quick_profiles_row, textvariable=self.profile_hotkey_2_var, width=12)
+        self.profile_hotkey_2_entry.pack(side=tk.LEFT, padx=4)
+        self.profile_hotkey_3_entry = ttk.Entry(quick_profiles_row, textvariable=self.profile_hotkey_3_var, width=12)
+        self.profile_hotkey_3_entry.pack(side=tk.LEFT, padx=4)
+
         history_group = ttk.LabelFrame(tab_monitor, text="Biome Alert History", padding=8)
         history_group.pack(fill="x", pady=(8, 0))
         self.biome_history_list = tk.Listbox(history_group, height=4)
@@ -603,6 +707,19 @@ class AntiAfkApp:
 
         timeline_group = ttk.LabelFrame(tab_monitor, text="Event Timeline", padding=8)
         timeline_group.pack(fill="x", pady=(8, 0))
+        timeline_actions = ttk.Frame(timeline_group)
+        timeline_actions.pack(fill="x", pady=(0, 4))
+        ttk.Label(timeline_actions, text="Filter:").pack(side=tk.LEFT)
+        self.event_filter_combo = ttk.Combobox(
+            timeline_actions,
+            textvariable=self.event_filter_var,
+            values=["all", "errors", "watchdog", "biome", "hotkeys", "health", "recovery"],
+            width=12,
+            state="readonly",
+        )
+        self.event_filter_combo.pack(side=tk.LEFT, padx=(6, 6))
+        self.event_filter_combo.bind("<<ComboboxSelected>>", lambda _e: self._refresh_event_history_view())
+        ttk.Button(timeline_actions, text="Export CSV", width=11, command=self.export_event_timeline_csv).pack(side=tk.LEFT)
         self.event_history_list = tk.Listbox(timeline_group, height=5)
         self.event_history_list.pack(fill="x")
 
@@ -614,6 +731,27 @@ class AntiAfkApp:
         ttk.Label(target_top, text="Double-click Enabled column to toggle per instance.").pack(side=tk.LEFT)
         ttk.Button(target_top, text="Enable All", command=self.enable_all_instances).pack(side=tk.RIGHT, padx=(6, 0))
         ttk.Button(target_top, text="Disable All", command=self.disable_all_instances).pack(side=tk.RIGHT)
+
+        target_overrides = ttk.Frame(target_group)
+        target_overrides.pack(fill="x", pady=(8, 0))
+        ttk.Label(target_overrides, text="Selected override interval (s):").pack(side=tk.LEFT)
+        self.instance_override_seconds_var = tk.StringVar(value="")
+        ttk.Entry(target_overrides, textvariable=self.instance_override_seconds_var, width=7, justify="center").pack(
+            side=tk.LEFT, padx=(6, 8)
+        )
+        ttk.Label(target_overrides, text="Pattern:").pack(side=tk.LEFT)
+        self.instance_override_pattern_var = tk.StringVar(value="default")
+        ttk.Combobox(
+            target_overrides,
+            textvariable=self.instance_override_pattern_var,
+            values=["default", "balanced", "subtle", "aggressive", "randomized"],
+            width=11,
+            state="readonly",
+        ).pack(side=tk.LEFT, padx=(6, 8))
+        ttk.Button(target_overrides, text="Apply to Selected", command=self.apply_selected_instance_overrides).pack(
+            side=tk.LEFT, padx=(0, 6)
+        )
+        ttk.Button(target_overrides, text="Clear Selected", command=self.clear_selected_instance_overrides).pack(side=tk.LEFT)
 
         tree_frame = ttk.Frame(target_group)
         tree_frame.pack(fill="both", expand=True, pady=(8, 0))
@@ -1063,7 +1201,7 @@ class AntiAfkApp:
 
         palette = self._normalize_theme_palette(raw_palette)
         if palette is None:
-            messagebox.showerror("Theme Maker", "Imported file does not contain a valid AFKScope theme palette.")
+            messagebox.showerror("Theme Maker", f"Imported file does not contain a valid {APP_NAME} theme palette.")
             return
 
         name = self._make_unique_custom_theme_name(raw_name)
@@ -1136,6 +1274,15 @@ class AntiAfkApp:
             selectbackground=palette["tree_sel"],
             selectforeground=palette["tree_selfg"],
         )
+        if hasattr(self, "event_history_list"):
+            self.event_history_list.configure(
+                bg=palette["field"],
+                fg=palette["text"],
+                highlightbackground=palette["panel"],
+                highlightcolor=palette["accent"],
+                selectbackground=palette["tree_sel"],
+                selectforeground=palette["tree_selfg"],
+            )
         if self.header_logo_label is not None:
             self.header_logo_label.configure(bg=palette["bg"])
         if self.header_title_label is not None:
@@ -1257,10 +1404,53 @@ class AntiAfkApp:
         line = f"{stamp} | {text}"
         self.event_timeline.append(line)
         self.event_timeline = self.event_timeline[-160:]
+        self._refresh_event_history_view()
+
+    def _event_matches_filter(self, event_line: str) -> bool:
+        mode = self.event_filter_var.get().strip().lower()
+        if mode in {"", "all"}:
+            return True
+        hay = event_line.lower()
+        if mode == "errors":
+            return ("error" in hay) or ("failed" in hay)
+        if mode == "watchdog":
+            return "watchdog" in hay
+        if mode == "biome":
+            return "biome" in hay
+        if mode == "hotkeys":
+            return "hotkey" in hay
+        if mode == "health":
+            return "health" in hay
+        if mode == "recovery":
+            return "recovery" in hay
+        return True
+
+    def _refresh_event_history_view(self) -> None:
         if hasattr(self, "event_history_list"):
             self.event_history_list.delete(0, tk.END)
-            for item in self.event_timeline[-60:]:
+            visible = [item for item in self.event_timeline if self._event_matches_filter(item)]
+            for item in visible[-60:]:
                 self.event_history_list.insert(tk.END, item)
+
+    def export_event_timeline_csv(self) -> None:
+        path = filedialog.asksaveasfilename(defaultextension=".csv", filetypes=[("CSV", "*.csv")])
+        if not path:
+            return
+        rows: list[dict[str, str]] = []
+        for line in self.event_timeline:
+            if not self._event_matches_filter(line):
+                continue
+            stamp, _, message = line.partition(" | ")
+            rows.append({"time": stamp.strip(), "event": message.strip()})
+        try:
+            with open(path, "w", newline="", encoding="utf-8") as handle:
+                writer = csv.DictWriter(handle, fieldnames=["time", "event"])
+                writer.writeheader()
+                writer.writerows(rows)
+            self.log(f"Event timeline exported: {path}")
+            self._record_event("Event CSV exported")
+        except Exception as exc:
+            messagebox.showerror("Export events failed", str(exc))
 
     def _maybe_send_biome_alert(self, biome: str) -> None:
         if not self.biome_alerts_enabled_var.get():
@@ -1273,7 +1463,7 @@ class AntiAfkApp:
         if now - last < self.biome_alert_cooldown_seconds:
             return
         self.last_biome_alert_at[biome] = now
-        self._send_webhook("AFKScope Rare Biome", f"Detected tracked rare biome: {biome}")
+        self._send_webhook(f"{APP_NAME} Rare Biome", f"Detected tracked rare biome: {biome}")
         action = self.biome_action_var.get().strip().lower()
         if action == "pause_5m":
             until = time.localtime(now + 300)
@@ -1346,8 +1536,29 @@ class AntiAfkApp:
         url = self.webhook_url_var.get().strip()
         if not url:
             return
+        self.webhook_queue.put((title, description, 0))
+        self._ensure_webhook_worker()
 
-        def _worker() -> None:
+    def _ensure_webhook_worker(self) -> None:
+        if self.webhook_worker_running:
+            return
+        self.webhook_worker_running = True
+        threading.Thread(target=self._webhook_worker, daemon=True).start()
+
+    def _webhook_worker(self) -> None:
+        while True:
+            try:
+                title, description, attempt = self.webhook_queue.get(timeout=0.4)
+            except queue.Empty:
+                if not self.webhook_enabled_var.get() or not self.is_running:
+                    self.webhook_worker_running = False
+                    return
+                continue
+
+            url = self.webhook_url_var.get().strip()
+            if not url:
+                continue
+
             payload = {
                 "embeds": [
                     {
@@ -1369,9 +1580,10 @@ class AntiAfkApp:
                 with urlrequest.urlopen(req, timeout=10):
                     pass
             except Exception:
-                pass
-
-        threading.Thread(target=_worker, daemon=True).start()
+                if attempt < 3:
+                    delay = 2 ** attempt
+                    time.sleep(delay)
+                    self.webhook_queue.put((title, description, attempt + 1))
 
     def set_running_ui(self, running: bool) -> None:
         self.is_running = running
@@ -1403,6 +1615,26 @@ class AntiAfkApp:
             raise ValueError("Watchdog threshold must be an integer.") from exc
         if value < 1:
             raise ValueError("Watchdog threshold must be >= 1.")
+        return value
+
+    def parse_no_windows_watchdog_threshold(self) -> int:
+        raw = self.watchdog_no_windows_threshold_var.get().strip() or self.watchdog_threshold_var.get().strip()
+        try:
+            value = int(raw)
+        except ValueError as exc:
+            raise ValueError("No-window watchdog threshold must be an integer.") from exc
+        if value < 1:
+            raise ValueError("No-window watchdog threshold must be >= 1.")
+        return value
+
+    def parse_jump_fail_watchdog_threshold(self) -> int:
+        raw = self.watchdog_jump_fail_threshold_var.get().strip() or self.watchdog_threshold_var.get().strip()
+        try:
+            value = int(raw)
+        except ValueError as exc:
+            raise ValueError("Jump-fail watchdog threshold must be an integer.") from exc
+        if value < 1:
+            raise ValueError("Jump-fail watchdog threshold must be >= 1.")
         return value
 
     def parse_health_alert_minutes(self) -> int:
@@ -1458,10 +1690,13 @@ class AntiAfkApp:
     def validate_runtime_settings(self) -> None:
         self.parse_interval()
         self.parse_watchdog_threshold()
+        self.parse_no_windows_watchdog_threshold()
+        self.parse_jump_fail_watchdog_threshold()
         if self.health_alert_enabled_var.get():
             self.parse_health_alert_minutes()
         if self.autosave_enabled_var.get():
             self.parse_autosave_minutes()
+        self.parse_manual_pause_minutes()
         self._validate_pause_schedule()
         if self.webhook_enabled_var.get():
             url = self.webhook_url_var.get().strip()
@@ -1546,7 +1781,7 @@ class AntiAfkApp:
 
         restore = messagebox.askyesno(
             "Recovery Snapshot Found",
-            "AFKScope detected a previous unclean shutdown.\n\nRestore settings from the latest auto-save snapshot?",
+            f"{APP_NAME} detected a previous unclean shutdown.\n\nRestore settings from the latest auto-save snapshot?",
         )
         if not restore:
             self.log("Recovery snapshot skipped by user.")
@@ -1579,7 +1814,7 @@ class AntiAfkApp:
 
         ttk.Label(
             container,
-            text="Welcome to AFKScope. Configure a safe baseline and save it in one step.",
+            text=f"Welcome to {APP_NAME}. Configure a safe baseline and save it in one step.",
             font=("Segoe UI", 10, "bold"),
         ).pack(anchor="w")
         ttk.Label(
@@ -1644,7 +1879,7 @@ class AntiAfkApp:
         if enabled:
             ok = self._register_global_hotkeys()
             if ok and log_result:
-                self.log("Global hotkeys enabled (Ctrl+Alt+S/J/R/T).")
+                self.log("Global hotkeys enabled (Ctrl+Alt+S/J/R/T/1/2/3).")
             elif not ok and log_result:
                 self.log("Global hotkeys unavailable (some combinations may already be in use).")
             self.hotkeys_enabled_var.set(ok)
@@ -1662,6 +1897,9 @@ class AntiAfkApp:
             (2, "Jump Now", ord("J"), self.test_jump),
             (3, "Refresh", ord("R"), lambda: self.refresh_instance_list(manual=True)),
             (4, "To Tray", ord("T"), self.minimize_to_tray),
+            (5, "Load Profile 1", ord("1"), lambda: self._hotkey_load_profile(1)),
+            (6, "Load Profile 2", ord("2"), lambda: self._hotkey_load_profile(2)),
+            (7, "Load Profile 3", ord("3"), lambda: self._hotkey_load_profile(3)),
         ]
         registered_count = 0
         for hotkey_id, label, vk, action in combos:
@@ -1676,6 +1914,17 @@ class AntiAfkApp:
         if self.global_hotkeys_registered:
             self.root.after(150, self._poll_global_hotkeys)
         return self.global_hotkeys_registered
+
+    def _hotkey_load_profile(self, slot: int) -> None:
+        preset = "default"
+        if slot == 1:
+            preset = self.profile_hotkey_1_var.get().strip() or "default"
+        elif slot == 2:
+            preset = self.profile_hotkey_2_var.get().strip() or "default"
+        elif slot == 3:
+            preset = self.profile_hotkey_3_var.get().strip() or "default"
+        self.preset_name_var.set(self._sanitize_preset_name(preset))
+        self.load_preset()
 
     def _unregister_global_hotkeys(self) -> None:
         for hotkey_id in list(self.hotkey_actions.keys()):
@@ -2055,9 +2304,18 @@ class AntiAfkApp:
                 confidence = self.pid_identity_confidence.get(pid, "unknown")
                 last_jump = self.instance_last_jump.get(hwnd)
                 last_jump_str = time.strftime("%H:%M:%S", time.localtime(last_jump)) if last_jump else "never"
+                age_str = "-"
+                if last_jump is not None:
+                    age = int(max(0, time.time() - last_jump))
+                    age_str = f"{age}s"
+                attempts = self.instance_attempt_count.get(hwnd, 0)
+                fails = self.instance_fail_count.get(hwnd, 0)
+                reliability = "n/a" if attempts == 0 else f"{max(0.0, (attempts - fails) * 100 / attempts):.0f}%"
+                quarantine_left = max(0, int(self.instance_quarantine_until.get(hwnd, 0.0) - time.time()))
+                quarantine_text = f" | quarantine {quarantine_left}s" if quarantine_left > 0 else ""
                 status = "ENABLED" if enabled else "DISABLED"
                 lines.append(
-                    f"PID {pid} | {username} ({confidence}) | HWND {hwnd} | {status} | last jump {last_jump_str} | {title[:26]}"
+                    f"PID {pid} | {username} ({confidence}) | HWND {hwnd} | {status} | last jump {last_jump_str} ({age_str}) | reliability {reliability}{quarantine_text} | {title[:22]}"
                 )
             lines.insert(1, f"Enabled {enabled_count}/{len(self.window_map)} instances")
 
@@ -2126,6 +2384,69 @@ class AntiAfkApp:
                 self.enabled_by_username[username.lower()] = False
         self.refresh_instance_list(manual=False)
         self.log("Disabled all detected instances.")
+
+    def apply_selected_instance_overrides(self) -> None:
+        selected = self.instance_tree.selection()
+        if not selected:
+            self.log("Override apply skipped: no row selected.")
+            return
+        raw_interval = self.instance_override_seconds_var.get().strip() if self.instance_override_seconds_var is not None else ""
+        raw_pattern = self.instance_override_pattern_var.get().strip().lower() if self.instance_override_pattern_var is not None else "default"
+        interval_override: float | None = None
+        if raw_interval:
+            try:
+                interval_override = float(raw_interval)
+            except ValueError:
+                messagebox.showerror("Instance Override", "Interval override must be a number.")
+                return
+            if interval_override <= 0:
+                messagebox.showerror("Instance Override", "Interval override must be > 0.")
+                return
+        if raw_pattern not in {"default", "balanced", "subtle", "aggressive", "randomized"}:
+            messagebox.showerror("Instance Override", "Invalid override pattern.")
+            return
+        applied = 0
+        for item in selected:
+            try:
+                hwnd = int(item)
+            except ValueError:
+                continue
+            pid = next((pid for h, _t, pid, _p in self.window_map if h == hwnd), None)
+            if pid is None:
+                continue
+            if interval_override is None:
+                self.instance_interval_override.pop(pid, None)
+            else:
+                self.instance_interval_override[pid] = interval_override
+            if raw_pattern == "default":
+                self.instance_pattern_override.pop(pid, None)
+            else:
+                self.instance_pattern_override[pid] = raw_pattern
+            applied += 1
+        if applied > 0:
+            self.log(f"Applied per-instance overrides to {applied} instance(s).")
+            self._record_event(f"Overrides applied: {applied}")
+            self.refresh_instance_list(manual=False)
+
+    def clear_selected_instance_overrides(self) -> None:
+        selected = self.instance_tree.selection()
+        if not selected:
+            return
+        cleared = 0
+        for item in selected:
+            try:
+                hwnd = int(item)
+            except ValueError:
+                continue
+            pid = next((pid for h, _t, pid, _p in self.window_map if h == hwnd), None)
+            if pid is None:
+                continue
+            self.instance_interval_override.pop(pid, None)
+            self.instance_pattern_override.pop(pid, None)
+            cleared += 1
+        if cleared > 0:
+            self.log(f"Cleared per-instance overrides for {cleared} instance(s).")
+            self._record_event(f"Overrides cleared: {cleared}")
 
     def spoof_focus(self, hwnd: int, active: bool) -> None:
         wm_activate = 0x0006
@@ -2259,6 +2580,10 @@ class AntiAfkApp:
         self.log(f"Restored {restored} Roblox windows.")
 
     def _is_in_pause_window(self) -> bool:
+        if self.pause_override_until is not None:
+            if time.time() < self.pause_override_until:
+                return True
+            self.pause_override_until = None
         if not self.pause_enabled_var.get():
             return False
         try:
@@ -2276,58 +2601,47 @@ class AntiAfkApp:
             return start_mins <= now_mins < end_mins
         return now_mins >= start_mins or now_mins < end_mins
 
-    def _resolve_target_hwnds(self) -> list[int]:
-        windows = self.find_roblox_windows()
-        enabled = [hwnd for hwnd, _title, _pid, _pname in windows if self.instance_enabled_by_hwnd.get(hwnd, True)]
-        if not enabled:
-            return []
-
-        if self.jump_mode_var.get() == "round":
-            self.round_robin_index = self.round_robin_index % len(enabled)
-            hwnd = enabled[self.round_robin_index]
-            self.round_robin_index = (self.round_robin_index + 1) % len(enabled)
-            return [hwnd]
-        return enabled
-
-    def _reset_gamepad_session(self) -> None:
-        self.gamepad = None
-        self.ensure_gamepad()
-        self.log("Watchdog reset: reinitialized gamepad session.")
-        self._send_webhook("AFKScope Watchdog", "Gamepad session reset after repeated failed cycles.")
-
-    def _run_recovery_sequence(self) -> None:
+    def parse_manual_pause_minutes(self) -> int:
+        raw = self.manual_pause_minutes_var.get().strip()
         try:
-            self.refresh_instance_list(manual=False)
-            self.restore_windows()
-            if self.auto_realign_var.get():
-                self.align_windows(log_result=False)
-            self._record_event("Recovery sequence executed")
+            value = int(raw)
+        except ValueError as exc:
+            raise ValueError("Quick pause minutes must be an integer.") from exc
+        if value < 1:
+            raise ValueError("Quick pause minutes must be >= 1.")
+        return value
+
+    def pause_for_minutes(self) -> None:
+        try:
+            minutes = self.parse_manual_pause_minutes()
         except Exception as exc:
-            self.log(f"Recovery sequence failed: {exc}")
-            self._record_event(f"Recovery failed: {exc}")
+            messagebox.showerror("Pause", str(exc))
+            return
+        self.pause_override_until = time.time() + (minutes * 60)
+        self.log(f"Manual pause enabled for {minutes} minute(s).")
+        self._record_event(f"Manual pause {minutes}m")
 
-    def jump_once(self) -> bool:
-        if self._is_in_pause_window():
-            with self.metrics_lock:
-                self.session_cycles += 1
-            return False
+    def clear_manual_pause(self) -> None:
+        if self.pause_override_until is None:
+            return
+        self.pause_override_until = None
+        self.log("Manual pause cleared.")
+        self._record_event("Manual pause cleared")
 
-        self.ensure_gamepad()
-        vg_module = cast(Any, self._ensure_vgamepad_module())
-        gamepad = self.gamepad
-        if gamepad is None:
-            raise RuntimeError("Virtual gamepad is not initialized.")
+    def _effective_pattern(self, pid: int) -> str:
+        pattern = self.instance_pattern_override.get(pid, "").strip().lower()
+        if pattern in {"balanced", "subtle", "aggressive", "randomized"}:
+            return pattern
+        return self.anti_idle_pattern_var.get().strip().lower()
 
-        target_hwnds = self._resolve_target_hwnds()
-        if not target_hwnds:
-            with self.metrics_lock:
-                self.session_cycles += 1
-            return False
+    def _effective_interval(self, pid: int, base_interval: float) -> float:
+        override = self.instance_interval_override.get(pid)
+        value = override if override is not None else base_interval
+        if self.safe_mode_var.get():
+            value = max(value, 7.0)
+        return max(0.5, value)
 
-        for hwnd in target_hwnds:
-            self.spoof_focus(hwnd, True)
-
-        pattern = self.anti_idle_pattern_var.get().strip().lower()
+    def _profile_from_pattern(self, pattern: str) -> tuple[int, float, float, float]:
         stick_x = 2000
         stick_hold = 0.05
         gap = 0.03
@@ -2345,36 +2659,115 @@ class AntiAfkApp:
             stick_hold = random.uniform(0.02, 0.1)
             gap = random.uniform(0.01, 0.05)
             button_hold = random.uniform(0.09, 0.17)
+        if self.safe_mode_var.get():
+            stick_x = max(700, min(stick_x, 2200))
+            stick_hold = max(stick_hold, 0.06)
+            gap = max(gap, 0.04)
+            button_hold = max(button_hold, 0.16)
+        return stick_x, stick_hold, gap, button_hold
 
-        gamepad.left_joystick(stick_x, 0)
-        gamepad.update()
-        time.sleep(stick_hold)
-        gamepad.left_joystick(0, 0)
-        gamepad.update()
-        time.sleep(gap)
+    def _resolve_target_hwnds(self, base_interval: float) -> list[int]:
+        windows = self.find_roblox_windows()
+        now = time.time()
+        enabled: list[int] = []
+        for hwnd, _title, pid, _pname in windows:
+            if not self.instance_enabled_by_hwnd.get(hwnd, True):
+                continue
+            quarantine_until = self.instance_quarantine_until.get(hwnd, 0.0)
+            if quarantine_until > now:
+                continue
+            interval = self._effective_interval(pid, base_interval)
+            last_jump = self.instance_last_jump.get(hwnd, 0.0)
+            if last_jump and (now - last_jump) < interval:
+                continue
+            enabled.append(hwnd)
+        if not enabled:
+            return []
 
-        jump_button = vg_module.XUSB_BUTTON.XUSB_GAMEPAD_A
-        gamepad.press_button(jump_button)
-        gamepad.update()
-        time.sleep(button_hold)
-        gamepad.release_button(jump_button)
-        gamepad.update()
+        if self.jump_mode_var.get() == "round":
+            self.round_robin_index = self.round_robin_index % len(enabled)
+            hwnd = enabled[self.round_robin_index]
+            self.round_robin_index = (self.round_robin_index + 1) % len(enabled)
+            return [hwnd]
+        return enabled
+
+    def _reset_gamepad_session(self) -> None:
+        self.gamepad = None
+        self.ensure_gamepad()
+        self.log("Watchdog reset: reinitialized gamepad session.")
+        self._send_webhook(f"{APP_NAME} Watchdog", "Gamepad session reset after repeated failed cycles.")
+
+    def _run_recovery_sequence(self) -> None:
+        try:
+            self.refresh_instance_list(manual=False)
+            self.restore_windows()
+            if self.auto_realign_var.get():
+                self.align_windows(log_result=False)
+            self._record_event("Recovery sequence executed")
+        except Exception as exc:
+            self.log(f"Recovery sequence failed: {exc}")
+            self._record_event(f"Recovery failed: {exc}")
+
+    def jump_once(self, base_interval: float) -> tuple[bool, str]:
+        if self._is_in_pause_window():
+            with self.metrics_lock:
+                self.session_cycles += 1
+            return False, "paused"
+
+        self.ensure_gamepad()
+        vg_module = cast(Any, self._ensure_vgamepad_module())
+        gamepad = self.gamepad
+        if gamepad is None:
+            raise RuntimeError("Virtual gamepad is not initialized.")
+
+        target_hwnds = self._resolve_target_hwnds(base_interval)
+        if not target_hwnds:
+            with self.metrics_lock:
+                self.session_cycles += 1
+            if not self.window_map:
+                return False, "no_windows"
+            return False, "not_due"
 
         for hwnd in target_hwnds:
+            self.spoof_focus(hwnd, True)
+        sent_count = 0
+        for hwnd in target_hwnds:
+            pid = next((pid for h, _t, pid, _p in self.window_map if h == hwnd), None)
+            if pid is None:
+                self.spoof_focus(hwnd, False)
+                continue
+            pattern = self._effective_pattern(pid)
+            stick_x, stick_hold, gap, button_hold = self._profile_from_pattern(pattern)
+            gamepad.left_joystick(stick_x, 0)
+            gamepad.update()
+            time.sleep(stick_hold)
+            gamepad.left_joystick(0, 0)
+            gamepad.update()
+            time.sleep(gap)
+            jump_button = vg_module.XUSB_BUTTON.XUSB_GAMEPAD_A
+            gamepad.press_button(jump_button)
+            gamepad.update()
+            time.sleep(button_hold)
+            gamepad.release_button(jump_button)
+            gamepad.update()
             self.spoof_focus(hwnd, False)
             self.instance_last_jump[hwnd] = time.time()
+            self.instance_attempt_count[hwnd] = self.instance_attempt_count.get(hwnd, 0) + 1
+            self.instance_fail_count[hwnd] = 0
+            self.instance_quarantine_until.pop(hwnd, None)
+            sent_count += 1
 
         with self.metrics_lock:
             self.session_cycles += 1
-            self.session_jumps += len(target_hwnds)
+            self.session_jumps += sent_count
 
         self.root.after(0, self.update_health_panel)
         self.root.after(0, lambda: self.refresh_instance_list(manual=False))
-        return True
+        return sent_count > 0, "sent" if sent_count > 0 else "not_due"
 
     def test_jump(self) -> None:
         try:
-            sent = self.jump_once()
+            sent, _reason = self.jump_once(base_interval=self.parse_interval())
             if sent:
                 self.log("Manual jump sent to enabled instances.")
             else:
@@ -2387,32 +2780,66 @@ class AntiAfkApp:
     def worker(self, interval: float) -> None:
         self.log(f"Anti-AFK loop started (interval={interval:.2f}s).")
         self._record_event("Loop started")
-        self._send_webhook("AFKScope", "Anti-AFK loop started.")
-        threshold = self.parse_watchdog_threshold() if self.watchdog_enabled_var.get() else 999999
+        self._send_webhook(APP_NAME, "Anti-AFK loop started.")
+        no_window_threshold = self.parse_no_windows_watchdog_threshold() if self.watchdog_enabled_var.get() else 999999
+        jump_fail_threshold = self.parse_jump_fail_watchdog_threshold() if self.watchdog_enabled_var.get() else 999999
 
         while not self.stop_event.is_set():
             try:
-                sent = self.jump_once()
+                sent, reason = self.jump_once(base_interval=interval)
                 if sent:
                     self.failed_cycles = 0
+                    self.no_window_cycles = 0
+                    self.jump_fail_cycles = 0
+                    if self.waiting_for_windows:
+                        self.waiting_for_windows = False
+                        self.log("Roblox windows found. Anti-AFK jumps resumed.")
+                        self._record_event("Window wait ended")
                     self.log("Sent virtual jump (A) to enabled spoofed instances.")
                     self._record_event("Jump cycle success")
                 else:
                     self.failed_cycles += 1
-                    self.log("No enabled Roblox windows found or cycle paused.")
+                    if reason == "no_windows":
+                        self.no_window_cycles += 1
+                        if self.start_when_windows_found_var.get():
+                            if not self.waiting_for_windows:
+                                self.waiting_for_windows = True
+                                self.log("Waiting for Roblox windows to appear before resuming jumps.")
+                                self._record_event("Waiting for windows")
+                        else:
+                            self.log("No Roblox windows found.")
+                    elif reason == "paused":
+                        self.log("Cycle paused by schedule/manual pause.")
+                    elif reason == "not_due":
+                        now = time.time()
+                        if (now - self.last_not_due_log_at) >= 30:
+                            self.last_not_due_log_at = now
+                            self.log("Cycle skipped (instance interval not due).")
+                    else:
+                        self.jump_fail_cycles += 1
+                        self.log("Cycle skipped (quarantine or per-instance interval not due).")
 
-                if self.watchdog_enabled_var.get() and self.failed_cycles >= threshold:
+                if self.watchdog_enabled_var.get() and self.no_window_cycles >= no_window_threshold:
+                    self.log("Watchdog: no windows threshold reached, refreshing instance scan.")
+                    self._record_event("Watchdog no-windows")
+                    self.refresh_instance_list(manual=False)
+                    self.no_window_cycles = 0
+
+                if self.watchdog_enabled_var.get() and self.jump_fail_cycles >= jump_fail_threshold:
+                    self.log("Watchdog: jump-fail threshold reached.")
+                    self._record_event("Watchdog jump-fail")
                     if self.recovery_enabled_var.get():
                         self._run_recovery_sequence()
                     self._reset_gamepad_session()
-                    self.failed_cycles = 0
+                    self.jump_fail_cycles = 0
             except Exception as exc:  # pragma: no cover
                 self.failed_cycles += 1
+                self.jump_fail_cycles += 1
                 with self.metrics_lock:
                     self.session_errors += 1
                 self.log(f"Error while sending jump: {exc}")
                 self._record_event(f"Loop error: {exc}")
-                self._send_webhook("AFKScope Error", f"Jump loop error: {exc}")
+                self._send_webhook(f"{APP_NAME} Error", f"Jump loop error: {exc}")
                 self.root.after(0, self.stop)
                 return
 
@@ -2421,7 +2848,7 @@ class AntiAfkApp:
 
         self.log("Anti-AFK loop stopped.")
         self._record_event("Loop stopped")
-        self._send_webhook("AFKScope", "Anti-AFK loop stopped.")
+        self._send_webhook(APP_NAME, "Anti-AFK loop stopped.")
 
     def start(self) -> None:
         if self.is_running:
@@ -2442,6 +2869,9 @@ class AntiAfkApp:
             if self.session_started_at is None:
                 self.session_started_at = time.time()
 
+        self.no_window_cycles = 0
+        self.jump_fail_cycles = 0
+        self.waiting_for_windows = False
         self.stop_event.clear()
         self.worker_thread = threading.Thread(target=self.worker, args=(interval,), daemon=True)
         self.worker_thread.start()
@@ -2452,6 +2882,7 @@ class AntiAfkApp:
         self.stop_event.set()
         if self.worker_thread and self.worker_thread.is_alive():
             self.worker_thread.join(timeout=0.5)
+        self.waiting_for_windows = False
         self.set_running_ui(False)
         self._write_recovery_snapshot(force=True)
 
@@ -2482,6 +2913,11 @@ class AntiAfkApp:
         self.last_instance_health_alert = {
             hwnd: ts for hwnd, ts in self.last_instance_health_alert.items() if hwnd in active_hwnds
         }
+        self.instance_attempt_count = {hwnd: count for hwnd, count in self.instance_attempt_count.items() if hwnd in active_hwnds}
+        self.instance_fail_count = {hwnd: count for hwnd, count in self.instance_fail_count.items() if hwnd in active_hwnds}
+        self.instance_quarantine_until = {
+            hwnd: ts for hwnd, ts in self.instance_quarantine_until.items() if hwnd in active_hwnds and ts > time.time()
+        }
         if not self.is_running or not self.health_alert_enabled_var.get():
             return
         try:
@@ -2507,9 +2943,15 @@ class AntiAfkApp:
                 f"No successful jump for PID {pid} ({username}) "
                 f"for {int(gap // 60)}m {int(gap % 60)}s."
             )
+            self.instance_fail_count[hwnd] = self.instance_fail_count.get(hwnd, 0) + 1
+            if self.instance_fail_count[hwnd] >= self.instance_quarantine_fail_threshold:
+                self.instance_quarantine_until[hwnd] = now + self.instance_quarantine_seconds
+                self.instance_fail_count[hwnd] = 0
+                self.log(f"Instance PID {pid} quarantined for {self.instance_quarantine_seconds}s due to repeated stale jumps.")
+                self._record_event(f"Quarantine PID {pid}")
             self.log(f"Instance health alert: {msg}")
             self._record_event(f"Health alert: PID {pid}")
-            self._send_webhook("AFKScope Instance Health Alert", msg)
+            self._send_webhook(f"{APP_NAME} Instance Health Alert", msg)
 
     def _enabled_by_pid_snapshot(self) -> dict[int, bool]:
         mapping: dict[int, bool] = {}
@@ -2530,9 +2972,21 @@ class AntiAfkApp:
             "webhook_url": self.webhook_url_var.get().strip(),
             "watchdog_enabled": bool(self.watchdog_enabled_var.get()),
             "watchdog_threshold": self.watchdog_threshold_var.get().strip(),
+            "watchdog_no_windows_threshold": self.watchdog_no_windows_threshold_var.get().strip(),
+            "watchdog_jump_fail_threshold": self.watchdog_jump_fail_threshold_var.get().strip(),
             "theme_name": self.theme_name_var.get().strip(),
             "anti_idle_pattern": self.anti_idle_pattern_var.get().strip(),
             "hotkeys_enabled": bool(self.hotkeys_enabled_var.get()),
+            "wait_for_windows": bool(self.start_when_windows_found_var.get()),
+            "safe_mode": bool(self.safe_mode_var.get()),
+            "quick_pause_minutes": self.manual_pause_minutes_var.get().strip(),
+            "profile_hotkey_1": self.profile_hotkey_1_var.get().strip(),
+            "profile_hotkey_2": self.profile_hotkey_2_var.get().strip(),
+            "profile_hotkey_3": self.profile_hotkey_3_var.get().strip(),
+            "startup_restore_enabled": bool(self.startup_restore_enabled_var.get()),
+            "startup_preset": self.startup_preset_var.get().strip(),
+            "startup_auto_start": bool(self.startup_auto_start_var.get()),
+            "startup_auto_align": bool(self.startup_auto_align_var.get()),
             "health_alert_enabled": bool(self.health_alert_enabled_var.get()),
             "health_alert_minutes": self.health_alert_minutes_var.get().strip(),
             "autosave_enabled": bool(self.autosave_enabled_var.get()),
@@ -2542,6 +2996,8 @@ class AntiAfkApp:
             "biome_action": self.biome_action_var.get().strip(),
             "biome_action_preset": self.biome_action_preset_var.get().strip(),
             "recovery_enabled": bool(self.recovery_enabled_var.get()),
+            "instance_interval_override_by_pid": {str(pid): value for pid, value in self.instance_interval_override.items()},
+            "instance_pattern_override_by_pid": {str(pid): value for pid, value in self.instance_pattern_override.items()},
         }
 
     def _apply_config_data(self, data: dict[str, Any]) -> None:
@@ -2555,10 +3011,34 @@ class AntiAfkApp:
                     enabled_by_pid[int(k)] = bool(v)
                 except (TypeError, ValueError):
                     continue
+        raw_interval_override = data.get("instance_interval_override_by_pid", {})
+        interval_override: dict[int, float] = {}
+        if isinstance(raw_interval_override, dict):
+            for k, v in raw_interval_override.items():
+                try:
+                    parsed = float(v)
+                    if parsed > 0:
+                        interval_override[int(k)] = parsed
+                except (TypeError, ValueError):
+                    continue
+        raw_pattern_override = data.get("instance_pattern_override_by_pid", {})
+        pattern_override: dict[int, str] = {}
+        if isinstance(raw_pattern_override, dict):
+            for k, v in raw_pattern_override.items():
+                if not isinstance(v, str):
+                    continue
+                pattern = v.strip().lower()
+                if pattern in {"balanced", "subtle", "aggressive", "randomized"}:
+                    try:
+                        pattern_override[int(k)] = pattern
+                    except (TypeError, ValueError):
+                        continue
 
         self.interval_var.set(interval)
         self.auto_realign_var.set(auto_realign)
         self.loaded_enabled_by_pid = enabled_by_pid
+        self.instance_interval_override = interval_override
+        self.instance_pattern_override = pattern_override
         self.jump_mode_var.set(str(data.get("jump_mode", "all")))
         self.pause_enabled_var.set(bool(data.get("pause_enabled", False)))
         self.pause_start_var.set(str(data.get("pause_start", "02:00")))
@@ -2567,6 +3047,8 @@ class AntiAfkApp:
         self.webhook_url_var.set(str(data.get("webhook_url", "")))
         self.watchdog_enabled_var.set(bool(data.get("watchdog_enabled", True)))
         self.watchdog_threshold_var.set(str(data.get("watchdog_threshold", "12")))
+        self.watchdog_no_windows_threshold_var.set(str(data.get("watchdog_no_windows_threshold", "24")))
+        self.watchdog_jump_fail_threshold_var.set(str(data.get("watchdog_jump_fail_threshold", "8")))
         theme_name = str(data.get("theme_name", "")).strip()
         if theme_name not in self.theme_palettes:
             legacy_dark = bool(data.get("dark_mode", False))
@@ -2577,6 +3059,16 @@ class AntiAfkApp:
             anti_pattern = "balanced"
         self.anti_idle_pattern_var.set(anti_pattern)
         self.hotkeys_enabled_var.set(bool(data.get("hotkeys_enabled", True)))
+        self.start_when_windows_found_var.set(bool(data.get("wait_for_windows", True)))
+        self.safe_mode_var.set(bool(data.get("safe_mode", False)))
+        self.manual_pause_minutes_var.set(str(data.get("quick_pause_minutes", "10")))
+        self.profile_hotkey_1_var.set(str(data.get("profile_hotkey_1", "default")).strip() or "default")
+        self.profile_hotkey_2_var.set(str(data.get("profile_hotkey_2", "farming")).strip() or "farming")
+        self.profile_hotkey_3_var.set(str(data.get("profile_hotkey_3", "overnight")).strip() or "overnight")
+        self.startup_restore_enabled_var.set(bool(data.get("startup_restore_enabled", False)))
+        self.startup_preset_var.set(str(data.get("startup_preset", "default")).strip() or "default")
+        self.startup_auto_start_var.set(bool(data.get("startup_auto_start", False)))
+        self.startup_auto_align_var.set(bool(data.get("startup_auto_align", False)))
         self.health_alert_enabled_var.set(bool(data.get("health_alert_enabled", True)))
         self.health_alert_minutes_var.set(str(data.get("health_alert_minutes", "3")))
         self.autosave_enabled_var.set(bool(data.get("autosave_enabled", True)))
@@ -2614,8 +3106,12 @@ class AntiAfkApp:
         if not names:
             names = ["default"]
         self.preset_combo.configure(values=names)
+        if hasattr(self, "startup_preset_combo"):
+            self.startup_preset_combo.configure(values=names)
         if self.preset_name_var.get().strip() not in names:
             self.preset_name_var.set(names[0])
+        if self.startup_preset_var.get().strip() not in names:
+            self.startup_preset_var.set(names[0])
 
     def save_preset(self) -> None:
         name = self._sanitize_preset_name(self.preset_name_var.get())
@@ -2676,7 +3172,7 @@ class AntiAfkApp:
         if self.webhook_enabled_var.get():
             webhook_validation = "OK" if self._is_valid_webhook_url(webhook_url) else "INVALID (must be HTTPS URL)"
         checks = [
-            f"AFKScope version: {APP_VERSION}",
+            f"{APP_NAME} version: {APP_VERSION}",
             f"Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
             f"vgamepad import: {self._vgamepad_status()}",
             f"Gamepad session: {'READY' if self.gamepad is not None else 'NOT INITIALIZED'}",
@@ -2685,10 +3181,13 @@ class AntiAfkApp:
             f"Current biome: {self.current_biome_name} ({self.current_biome_source})",
             f"Theme: {self.current_theme_name}",
             f"Anti-idle pattern: {self.anti_idle_pattern_var.get()}",
-            f"Global hotkeys: {'ON' if self.hotkeys_enabled_var.get() else 'OFF'} (Ctrl+Alt+S/J/R/T)",
+            f"Global hotkeys: {'ON' if self.hotkeys_enabled_var.get() else 'OFF'} (Ctrl+Alt+S/J/R/T/1/2/3)",
+            f"Wait for windows mode: {'ON' if self.start_when_windows_found_var.get() else 'OFF'}",
+            f"Safe mode: {'ON' if self.safe_mode_var.get() else 'OFF'}",
             f"Instance health alerts: {'ON' if self.health_alert_enabled_var.get() else 'OFF'} ({self.health_alert_minutes_var.get().strip() or '3'} min)",
             f"Recovery auto-save: {'ON' if self.autosave_enabled_var.get() else 'OFF'} ({self.autosave_minutes_var.get().strip() or '2'} min)",
             f"Recovery sequence: {'ON' if self.recovery_enabled_var.get() else 'OFF'}",
+            f"Watchdog thresholds: no-windows={self.watchdog_no_windows_threshold_var.get().strip() or '24'} jump-fail={self.watchdog_jump_fail_threshold_var.get().strip() or '8'}",
             f"Webhook configured: {'YES' if webhook_on else 'NO'}",
             f"Webhook URL validation: {webhook_validation}",
             f"Pause schedule validation: {pause_validation}",
@@ -2706,7 +3205,7 @@ class AntiAfkApp:
 
     def export_debug_bundle(self) -> None:
         stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-        default_name = f"afkscope-debug-{stamp}.zip"
+        default_name = f"stayactive-debug-{stamp}.zip"
         path = filedialog.asksaveasfilename(
             defaultextension=".zip",
             initialfile=default_name,
@@ -2723,12 +3222,12 @@ class AntiAfkApp:
         try:
             with zipfile.ZipFile(path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
                 zf.writestr("diagnostics.txt", diagnostics_body + "\n")
-                zf.writestr("afkscope-log-tail.txt", "\n".join(app_log_tail) + "\n")
+                zf.writestr("stayactive-log-tail.txt", "\n".join(app_log_tail) + "\n")
                 zf.writestr("biome-history.txt", "\n".join(biome_history) + "\n")
                 if os.path.exists(self.config_path):
-                    zf.write(self.config_path, arcname="afkscope_config.json")
+                    zf.write(self.config_path, arcname="stayactive_config.json")
                 if os.path.exists(self.theme_config_path):
-                    zf.write(self.theme_config_path, arcname="afkscope_themes.json")
+                    zf.write(self.theme_config_path, arcname="stayactive_themes.json")
                 latest_log = self._find_latest_biome_log()
                 if latest_log and os.path.exists(latest_log):
                     try:
@@ -2770,6 +3269,9 @@ class AntiAfkApp:
     def export_instances(self, mode: str) -> None:
         rows: list[dict[str, Any]] = []
         for hwnd, title, pid, pname in self.window_map:
+            attempts = self.instance_attempt_count.get(hwnd, 0)
+            fails = self.instance_fail_count.get(hwnd, 0)
+            reliability = None if attempts == 0 else max(0.0, (attempts - fails) * 100 / attempts)
             rows.append(
                 {
                     "enabled": self.instance_enabled_by_hwnd.get(hwnd, True),
@@ -2779,6 +3281,9 @@ class AntiAfkApp:
                     "username": self.pid_username.get(pid, ""),
                     "identity": self.pid_identity_confidence.get(pid, "unknown"),
                     "last_jump": self.instance_last_jump.get(hwnd),
+                    "interval_override": self.instance_interval_override.get(pid),
+                    "pattern_override": self.instance_pattern_override.get(pid, ""),
+                    "reliability_percent": reliability,
                     "title": title,
                 }
             )
@@ -2796,7 +3301,22 @@ class AntiAfkApp:
         if not path:
             return
         with open(path, "w", newline="", encoding="utf-8") as f:
-            writer = csv.DictWriter(f, fieldnames=["enabled", "pid", "hwnd", "process", "username", "identity", "last_jump", "title"])
+            writer = csv.DictWriter(
+                f,
+                fieldnames=[
+                    "enabled",
+                    "pid",
+                    "hwnd",
+                    "process",
+                    "username",
+                    "identity",
+                    "last_jump",
+                    "interval_override",
+                    "pattern_override",
+                    "reliability_percent",
+                    "title",
+                ],
+            )
             writer.writeheader()
             writer.writerows(rows)
         self.log(f"Exported CSV: {path}")
@@ -2862,7 +3382,7 @@ class AntiAfkApp:
             messagebox.showerror("Copy support bundle failed", str(exc))
 
     def open_latest_release_page(self) -> None:
-        target = self.latest_release_url or "https://github.com/0bl1terate3/AFKScope/releases/latest"
+        target = self.latest_release_url or "https://github.com/0bl1terate3/StayActive/releases/latest"
         opened = webbrowser.open(target)
         if opened:
             self._record_event("Opened release page")
@@ -2870,7 +3390,7 @@ class AntiAfkApp:
             messagebox.showinfo("Release page", target)
 
     def check_for_updates(self) -> None:
-        release = self._fetch_json("https://api.github.com/repos/0bl1terate3/AFKScope/releases/latest")
+        release = self._fetch_json("https://api.github.com/repos/0bl1terate3/StayActive/releases/latest")
         if not release:
             messagebox.showinfo("Updates", "Could not check for updates right now.")
             return
@@ -2912,7 +3432,7 @@ class AntiAfkApp:
 
     def export_portable_bundle(self) -> None:
         stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-        default_name = f"afkscope-portable-{stamp}.zip"
+        default_name = f"stayactive-portable-{stamp}.zip"
         path = filedialog.asksaveasfilename(
             defaultextension=".zip",
             initialfile=default_name,
@@ -2924,9 +3444,9 @@ class AntiAfkApp:
         try:
             with zipfile.ZipFile(path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
                 if os.path.exists(self.config_path):
-                    zf.write(self.config_path, arcname="afkscope_config.json")
+                    zf.write(self.config_path, arcname="stayactive_config.json")
                 if os.path.exists(self.theme_config_path):
-                    zf.write(self.theme_config_path, arcname="afkscope_themes.json")
+                    zf.write(self.theme_config_path, arcname="stayactive_themes.json")
                 if os.path.isdir(self.presets_dir):
                     for name in os.listdir(self.presets_dir):
                         full = os.path.join(self.presets_dir, name)
@@ -2944,11 +3464,11 @@ class AntiAfkApp:
         try:
             with zipfile.ZipFile(path, "r") as zf:
                 members = zf.namelist()
-                if "afkscope_config.json" in members:
-                    with zf.open("afkscope_config.json") as src, open(self.config_path, "wb") as dst:
+                if "stayactive_config.json" in members:
+                    with zf.open("stayactive_config.json") as src, open(self.config_path, "wb") as dst:
                         dst.write(src.read())
-                if "afkscope_themes.json" in members:
-                    with zf.open("afkscope_themes.json") as src, open(self.theme_config_path, "wb") as dst:
+                if "stayactive_themes.json" in members:
+                    with zf.open("stayactive_themes.json") as src, open(self.theme_config_path, "wb") as dst:
                         dst.write(src.read())
                 os.makedirs(self.presets_dir, exist_ok=True)
                 for name in members:
@@ -2966,6 +3486,9 @@ class AntiAfkApp:
             messagebox.showerror("Import portable bundle failed", str(exc))
 
     def build_exe(self) -> None:
+        exe_name = APP_NAME.replace(" ", "")
+        icon_asset = APP_ICON_ICO
+        icon_png_asset = APP_ICON_PNG
         cmd = [
             sys.executable,
             "-m",
@@ -2975,13 +3498,13 @@ class AntiAfkApp:
             "--onefile",
             "--windowed",
             "--name",
-            "AFKScope",
+            exe_name,
             "--icon",
-            "AFKSCOPE ICON.ico",
+            icon_asset,
             "--add-data",
-            "AFKSCOPE ICON.ico;.",
+            f"{icon_asset};.",
             "--add-data",
-            "assets/afkscope-header-logo.png;assets",
+            f"{icon_png_asset};.",
             "--collect-binaries",
             "vgamepad",
             "--collect-data",
@@ -2996,7 +3519,7 @@ class AntiAfkApp:
             try:
                 result = subprocess.run(cmd, cwd=os.getcwd(), capture_output=True, text=True, timeout=600)
                 if result.returncode == 0:
-                    self.log("Build EXE complete: dist/AFKScope.exe")
+                    self.log(f"Build EXE complete: dist/{exe_name}.exe")
                 else:
                     self.log("Build EXE failed. Run in terminal to inspect output.")
             except Exception as exc:
@@ -3035,7 +3558,7 @@ class AntiAfkApp:
             pystray.MenuItem("Stop", lambda _icon, _item: self.root.after(0, self.stop)),
             pystray.MenuItem("Quit", lambda _icon, _item: _quit()),
         )
-        self.tray_icon = pystray.Icon("AFKScope", self._make_tray_image(), "AFKScope", menu)
+        self.tray_icon = pystray.Icon(APP_NAME, self._make_tray_image(), APP_NAME, menu)
         threading.Thread(target=self.tray_icon.run, daemon=True).start()
         self.log("Minimized to tray.")
 
