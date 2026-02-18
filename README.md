@@ -144,6 +144,15 @@ pip install pystray pillow
 - Added per-process limiter state visibility (PID, state, boost window, title).
 - Added limiter diagnostics output in the checks panel and support bundle text.
 - Added limiter config persistence to normal config + preset save/load.
+- Added runtime setting sync so UI changes are reflected consistently in active loop behavior.
+- Added input-aware Roblox auto-pause (detects active user input and briefly backs off virtual input sends).
+- Added per-window recovery tiers/backoff tracking to reduce repeated send-failure spam and improve stability.
+- Added safer window targeting with short-lived scan caching and improved round-robin/weighted scheduling flow.
+- Added config/preset hardening: config schema normalization, invalid config backup, and atomic JSON writes.
+- Moved runtime data/config storage to `%LOCALAPPDATA%\\StayActive` with migration of legacy files on startup.
+- Added thread-safety improvements for UI logging/event updates and bounded in-app log retention.
+- Added portable import integrity checks (checksum validation from metadata when present).
+- Updated PyInstaller spec output metadata to `StayActive` naming and admin manifest settings.
 
 ## Previous Notes (v0.1.4)
 
