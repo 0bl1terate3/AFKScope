@@ -4,6 +4,7 @@ import ctypes
 import json
 import math
 import os
+import random
 import re
 import subprocess
 import sys
@@ -97,7 +98,7 @@ BIOME_ALIAS_MAP: dict[str, str] = {
     "aurora": "AURORA",
 }
 
-APP_VERSION = "0.2.3"
+APP_VERSION = "0.2.5"
 APP_USER_AGENT = f"AFKScope/{APP_VERSION}"
 
 
@@ -136,6 +137,7 @@ class AntiAfkApp:
         self.auto_realign_var = tk.BooleanVar(value=False)
         self.jump_mode_var = tk.StringVar(value="all")
         self.theme_name_var = tk.StringVar(value="Midnight")
+        self.anti_idle_pattern_var = tk.StringVar(value="balanced")
 
         self.pause_enabled_var = tk.BooleanVar(value=False)
         self.pause_start_var = tk.StringVar(value="02:00")
@@ -149,6 +151,9 @@ class AntiAfkApp:
         self.preset_name_var = tk.StringVar(value="default")
         self.biome_alerts_enabled_var = tk.BooleanVar(value=False)
         self.rare_biome_var = tk.StringVar(value="GLITCHED")
+        self.biome_action_var = tk.StringVar(value="webhook")
+        self.biome_action_preset_var = tk.StringVar(value="default")
+        self.recovery_enabled_var = tk.BooleanVar(value=True)
 
         self.window_map: list[tuple[int, str, int, str]] = []
         self._process_name_cache: dict[int, str] = {}
@@ -223,6 +228,7 @@ class AntiAfkApp:
         self.biome_log_path: str | None = None
         self.biome_log_offset = 0
         self.biome_history: list[str] = []
+        self.event_timeline: list[str] = []
         self.biome_alert_cooldown_seconds = 45
         self.last_biome_alert_at: dict[str, float] = {}
 
@@ -398,6 +404,19 @@ class AntiAfkApp:
         ttk.Checkbutton(opt3, text="Watchdog reset if no successful jumps", variable=self.watchdog_enabled_var).pack(side=tk.LEFT)
         ttk.Label(opt3, text="Threshold cycles:").pack(side=tk.LEFT, padx=(10, 4))
         ttk.Entry(opt3, textvariable=self.watchdog_threshold_var, width=5, justify="center").pack(side=tk.LEFT)
+        ttk.Checkbutton(opt3, text="Recovery sequence", variable=self.recovery_enabled_var).pack(side=tk.LEFT, padx=(12, 0))
+
+        pattern_row = ttk.Frame(options_group)
+        pattern_row.pack(fill="x", pady=(6, 0))
+        ttk.Label(pattern_row, text="Anti-idle pattern:").pack(side=tk.LEFT)
+        self.pattern_combo = ttk.Combobox(
+            pattern_row,
+            textvariable=self.anti_idle_pattern_var,
+            values=["balanced", "subtle", "aggressive", "randomized"],
+            width=12,
+            state="readonly",
+        )
+        self.pattern_combo.pack(side=tk.LEFT, padx=(8, 0))
 
         biome_row = ttk.Frame(options_group)
         biome_row.pack(fill="x", pady=(8, 0))
@@ -427,10 +446,29 @@ class AntiAfkApp:
         )
         self.rare_biome_combo.pack(side=tk.LEFT)
 
+        action_row = ttk.Frame(options_group)
+        action_row.pack(fill="x", pady=(6, 0))
+        ttk.Label(action_row, text="Rare biome action:").pack(side=tk.LEFT)
+        self.biome_action_combo = ttk.Combobox(
+            action_row,
+            textvariable=self.biome_action_var,
+            values=["webhook", "pause_5m", "load_preset"],
+            width=12,
+            state="readonly",
+        )
+        self.biome_action_combo.pack(side=tk.LEFT, padx=(8, 8))
+        ttk.Label(action_row, text="Preset").pack(side=tk.LEFT)
+        ttk.Entry(action_row, textvariable=self.biome_action_preset_var, width=16).pack(side=tk.LEFT, padx=(6, 0))
+
         history_group = ttk.LabelFrame(tab_monitor, text="Biome Alert History", padding=8)
         history_group.pack(fill="x", pady=(8, 0))
         self.biome_history_list = tk.Listbox(history_group, height=4)
         self.biome_history_list.pack(fill="x")
+
+        timeline_group = ttk.LabelFrame(tab_monitor, text="Event Timeline", padding=8)
+        timeline_group.pack(fill="x", pady=(8, 0))
+        self.event_history_list = tk.Listbox(timeline_group, height=5)
+        self.event_history_list.pack(fill="x")
 
         target_group = ttk.LabelFrame(tab_instances, text="Per Instance Controls", padding=10)
         target_group.pack(fill="both", expand=True, pady=(8, 0))
@@ -486,6 +524,9 @@ class AntiAfkApp:
         diag_row.pack(fill="x", pady=(0, 6))
         ttk.Button(diag_row, text="Run Checks", width=12, command=self.run_diagnostics_checks).pack(side=tk.LEFT, padx=(0, 5))
         ttk.Button(diag_row, text="Export Debug Bundle", width=18, command=self.export_debug_bundle).pack(side=tk.LEFT)
+        ttk.Button(diag_row, text="Check Updates", width=13, command=self.check_for_updates).pack(side=tk.LEFT, padx=(5, 5))
+        ttk.Button(diag_row, text="Export Portable", width=14, command=self.export_portable_bundle).pack(side=tk.LEFT, padx=(0, 5))
+        ttk.Button(diag_row, text="Import Portable", width=14, command=self.import_portable_bundle).pack(side=tk.LEFT)
         self.diagnostics_text = tk.Text(diag_group, height=5, font=("Consolas", 9), state=tk.DISABLED)
         self.diagnostics_text.pack(fill="x")
 
@@ -535,6 +576,7 @@ class AntiAfkApp:
         self.current_palette = dict(palette)
         self._apply_theme(self.current_palette)
         self.log(f"Theme applied: {name}")
+        self._record_event(f"Theme: {name}")
 
     def _apply_theme(self, palette: dict[str, str]) -> None:
         try:
@@ -687,6 +729,16 @@ class AntiAfkApp:
             for item in self.biome_history[-40:]:
                 self.biome_history_list.insert(tk.END, item)
 
+    def _record_event(self, text: str) -> None:
+        stamp = time.strftime("%H:%M:%S")
+        line = f"{stamp} | {text}"
+        self.event_timeline.append(line)
+        self.event_timeline = self.event_timeline[-160:]
+        if hasattr(self, "event_history_list"):
+            self.event_history_list.delete(0, tk.END)
+            for item in self.event_timeline[-60:]:
+                self.event_history_list.insert(tk.END, item)
+
     def _maybe_send_biome_alert(self, biome: str) -> None:
         if not self.biome_alerts_enabled_var.get():
             return
@@ -699,6 +751,18 @@ class AntiAfkApp:
             return
         self.last_biome_alert_at[biome] = now
         self._send_webhook("AFKScope Rare Biome", f"Detected tracked rare biome: {biome}")
+        action = self.biome_action_var.get().strip().lower()
+        if action == "pause_5m":
+            until = time.localtime(now + 300)
+            self.pause_enabled_var.set(True)
+            self.pause_start_var.set(time.strftime("%H:%M", time.localtime(now)))
+            self.pause_end_var.set(time.strftime("%H:%M", until))
+            self.log("Rare biome action: pause schedule set for 5 minutes.")
+            self._record_event("Rare biome action: pause_5m")
+        elif action == "load_preset":
+            self.preset_name_var.set(self.biome_action_preset_var.get().strip() or "default")
+            self.load_preset()
+            self._record_event("Rare biome action: load_preset")
 
     def _set_current_biome(self, biome: str, source: str) -> None:
         if biome not in BIOME_COLOR_MAP:
@@ -1410,6 +1474,17 @@ class AntiAfkApp:
         self.log("Watchdog reset: reinitialized gamepad session.")
         self._send_webhook("AFKScope Watchdog", "Gamepad session reset after repeated failed cycles.")
 
+    def _run_recovery_sequence(self) -> None:
+        try:
+            self.refresh_instance_list(manual=False)
+            self.restore_windows()
+            if self.auto_realign_var.get():
+                self.align_windows(log_result=False)
+            self._record_event("Recovery sequence executed")
+        except Exception as exc:
+            self.log(f"Recovery sequence failed: {exc}")
+            self._record_event(f"Recovery failed: {exc}")
+
     def jump_once(self) -> bool:
         if self._is_in_pause_window():
             with self.metrics_lock:
@@ -1431,17 +1506,36 @@ class AntiAfkApp:
         for hwnd in target_hwnds:
             self.spoof_focus(hwnd, True)
 
-        gamepad.left_joystick(2000, 0)
+        pattern = self.anti_idle_pattern_var.get().strip().lower()
+        stick_x = 2000
+        stick_hold = 0.05
+        gap = 0.03
+        button_hold = 0.12
+        if pattern == "subtle":
+            stick_x = random.randint(900, 1600)
+            stick_hold = 0.03
+            button_hold = 0.1
+        elif pattern == "aggressive":
+            stick_x = random.randint(2600, 4200)
+            stick_hold = 0.08
+            button_hold = 0.14
+        elif pattern == "randomized":
+            stick_x = random.randint(800, 4600)
+            stick_hold = random.uniform(0.02, 0.1)
+            gap = random.uniform(0.01, 0.05)
+            button_hold = random.uniform(0.09, 0.17)
+
+        gamepad.left_joystick(stick_x, 0)
         gamepad.update()
-        time.sleep(0.05)
+        time.sleep(stick_hold)
         gamepad.left_joystick(0, 0)
         gamepad.update()
-        time.sleep(0.03)
+        time.sleep(gap)
 
         jump_button = vg_module.XUSB_BUTTON.XUSB_GAMEPAD_A
         gamepad.press_button(jump_button)
         gamepad.update()
-        time.sleep(0.12)
+        time.sleep(button_hold)
         gamepad.release_button(jump_button)
         gamepad.update()
 
@@ -1471,6 +1565,7 @@ class AntiAfkApp:
 
     def worker(self, interval: float) -> None:
         self.log(f"Anti-AFK loop started (interval={interval:.2f}s).")
+        self._record_event("Loop started")
         self._send_webhook("AFKScope", "Anti-AFK loop started.")
         threshold = self.parse_watchdog_threshold() if self.watchdog_enabled_var.get() else 999999
 
@@ -1480,11 +1575,14 @@ class AntiAfkApp:
                 if sent:
                     self.failed_cycles = 0
                     self.log("Sent virtual jump (A) to enabled spoofed instances.")
+                    self._record_event("Jump cycle success")
                 else:
                     self.failed_cycles += 1
                     self.log("No enabled Roblox windows found or cycle paused.")
 
                 if self.watchdog_enabled_var.get() and self.failed_cycles >= threshold:
+                    if self.recovery_enabled_var.get():
+                        self._run_recovery_sequence()
                     self._reset_gamepad_session()
                     self.failed_cycles = 0
             except Exception as exc:  # pragma: no cover
@@ -1492,6 +1590,7 @@ class AntiAfkApp:
                 with self.metrics_lock:
                     self.session_errors += 1
                 self.log(f"Error while sending jump: {exc}")
+                self._record_event(f"Loop error: {exc}")
                 self._send_webhook("AFKScope Error", f"Jump loop error: {exc}")
                 self.root.after(0, self.stop)
                 return
@@ -1500,6 +1599,7 @@ class AntiAfkApp:
                 break
 
         self.log("Anti-AFK loop stopped.")
+        self._record_event("Loop stopped")
         self._send_webhook("AFKScope", "Anti-AFK loop stopped.")
 
     def start(self) -> None:
@@ -1573,8 +1673,12 @@ class AntiAfkApp:
             "watchdog_enabled": bool(self.watchdog_enabled_var.get()),
             "watchdog_threshold": self.watchdog_threshold_var.get().strip(),
             "theme_name": self.theme_name_var.get().strip(),
+            "anti_idle_pattern": self.anti_idle_pattern_var.get().strip(),
             "biome_alerts_enabled": bool(self.biome_alerts_enabled_var.get()),
             "rare_biome": self.rare_biome_var.get().strip().upper(),
+            "biome_action": self.biome_action_var.get().strip(),
+            "biome_action_preset": self.biome_action_preset_var.get().strip(),
+            "recovery_enabled": bool(self.recovery_enabled_var.get()),
         }
 
     def _apply_config_data(self, data: dict[str, Any]) -> None:
@@ -1605,8 +1709,18 @@ class AntiAfkApp:
             legacy_dark = bool(data.get("dark_mode", False))
             theme_name = "Midnight" if legacy_dark else "Solarized Light"
         self.theme_name_var.set(theme_name)
+        anti_pattern = str(data.get("anti_idle_pattern", "balanced")).strip().lower()
+        if anti_pattern not in {"balanced", "subtle", "aggressive", "randomized"}:
+            anti_pattern = "balanced"
+        self.anti_idle_pattern_var.set(anti_pattern)
         self.biome_alerts_enabled_var.set(bool(data.get("biome_alerts_enabled", False)))
         self.rare_biome_var.set(str(data.get("rare_biome", "GLITCHED")).strip().upper() or "GLITCHED")
+        biome_action = str(data.get("biome_action", "webhook")).strip().lower()
+        if biome_action not in {"webhook", "pause_5m", "load_preset"}:
+            biome_action = "webhook"
+        self.biome_action_var.set(biome_action)
+        self.biome_action_preset_var.set(str(data.get("biome_action_preset", "default")).strip())
+        self.recovery_enabled_var.set(bool(data.get("recovery_enabled", True)))
         self._apply_selected_theme()
         self.refresh_instance_list(manual=False)
 
@@ -1692,8 +1806,11 @@ class AntiAfkApp:
             f"Biome log source: {latest_log}",
             f"Current biome: {self.current_biome_name} ({self.current_biome_source})",
             f"Theme: {self.current_theme_name}",
+            f"Anti-idle pattern: {self.anti_idle_pattern_var.get()}",
+            f"Recovery sequence: {'ON' if self.recovery_enabled_var.get() else 'OFF'}",
             f"Webhook configured: {'YES' if webhook_on else 'NO'}",
             f"Rare biome alerts: {'ON' if self.biome_alerts_enabled_var.get() else 'OFF'} ({self.rare_biome_var.get().strip().upper() or 'GLITCHED'})",
+            f"Rare biome action: {self.biome_action_var.get()} ({self.biome_action_preset_var.get().strip() or 'default'})",
             f"Session errors: {self.session_errors}",
         ]
         body = "\n".join(checks)
@@ -1797,6 +1914,72 @@ class AntiAfkApp:
             writer.writeheader()
             writer.writerows(rows)
         self.log(f"Exported CSV: {path}")
+
+    def check_for_updates(self) -> None:
+        release = self._fetch_json("https://api.github.com/repos/0bl1terate3/AFKScope/releases/latest")
+        if not release:
+            messagebox.showinfo("Updates", "Could not check for updates right now.")
+            return
+        tag = str(release.get("tag_name", "")).strip()
+        url = str(release.get("html_url", "")).strip()
+        if not tag:
+            messagebox.showinfo("Updates", "Latest release tag was not found.")
+            return
+        if tag.lstrip("v") == APP_VERSION:
+            messagebox.showinfo("Updates", f"You're up to date ({APP_VERSION}).")
+            self._record_event("Update check: up to date")
+            return
+        self._record_event(f"Update available: {tag}")
+        messagebox.showinfo("Update Available", f"Latest: {tag}\nCurrent: v{APP_VERSION}\n\n{url}")
+
+    def export_portable_bundle(self) -> None:
+        stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        default_name = f"afkscope-portable-{stamp}.zip"
+        path = filedialog.asksaveasfilename(
+            defaultextension=".zip",
+            initialfile=default_name,
+            filetypes=[("Zip archive", "*.zip")],
+        )
+        if not path:
+            return
+        self.save_config()
+        try:
+            with zipfile.ZipFile(path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+                if os.path.exists(self.config_path):
+                    zf.write(self.config_path, arcname="afkscope_config.json")
+                if os.path.isdir(self.presets_dir):
+                    for name in os.listdir(self.presets_dir):
+                        full = os.path.join(self.presets_dir, name)
+                        if os.path.isfile(full) and name.lower().endswith(".json"):
+                            zf.write(full, arcname=os.path.join("presets", name))
+            self.log(f"Portable bundle exported: {path}")
+            self._record_event("Portable export completed")
+        except Exception as exc:
+            messagebox.showerror("Export portable bundle failed", str(exc))
+
+    def import_portable_bundle(self) -> None:
+        path = filedialog.askopenfilename(filetypes=[("Zip archive", "*.zip")])
+        if not path:
+            return
+        try:
+            with zipfile.ZipFile(path, "r") as zf:
+                members = zf.namelist()
+                if "afkscope_config.json" in members:
+                    with zf.open("afkscope_config.json") as src, open(self.config_path, "wb") as dst:
+                        dst.write(src.read())
+                os.makedirs(self.presets_dir, exist_ok=True)
+                for name in members:
+                    normalized = name.replace("\\", "/")
+                    if normalized.startswith("presets/") and normalized.lower().endswith(".json"):
+                        target = os.path.join(self.presets_dir, os.path.basename(normalized))
+                        with zf.open(name) as src, open(target, "wb") as dst:
+                            dst.write(src.read())
+            self._refresh_preset_list()
+            self.load_config(silent=True)
+            self.log(f"Portable bundle imported: {path}")
+            self._record_event("Portable import completed")
+        except Exception as exc:
+            messagebox.showerror("Import portable bundle failed", str(exc))
 
     def build_exe(self) -> None:
         cmd = [
