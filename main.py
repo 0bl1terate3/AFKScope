@@ -135,6 +135,7 @@ class AntiAfkApp:
         self.stats_var = tk.StringVar(value="Runtime 00:00:00 | Cycles 0 | Jumps 0 | Errors 0")
         self.auto_realign_var = tk.BooleanVar(value=False)
         self.jump_mode_var = tk.StringVar(value="all")
+        self.theme_mode_var = tk.StringVar(value="system")
         self.dark_mode_var = tk.BooleanVar(value=False)
 
         self.pause_enabled_var = tk.BooleanVar(value=False)
@@ -180,6 +181,7 @@ class AntiAfkApp:
 
         self.theme_animating = False
         self.theme_animation_after_id: str | None = None
+        self.system_theme_poll_after_id: str | None = None
         self.current_theme_t = 0.0
         self.palette_light = {
             "bg": "#f2f2f2",
@@ -260,8 +262,7 @@ class AntiAfkApp:
         ]
 
         self._build_ui()
-        self._update_theme_toggle_icon()
-        self._apply_theme(self.palette_light)
+        self._apply_current_theme_mode(animated=False)
         self._render_biome_badge()
         os.makedirs(self.presets_dir, exist_ok=True)
         self._refresh_preset_list()
@@ -289,6 +290,7 @@ class AntiAfkApp:
             self.run_diagnostics_checks()
             self._schedule_stats_update()
             self._schedule_instance_poll()
+            self._schedule_system_theme_poll()
         except Exception as exc:
             self.log(f"Startup checks failed: {exc}")
 
@@ -310,7 +312,7 @@ class AntiAfkApp:
             header,
             text="\u2600",
             width=3,
-            command=self.toggle_dark_mode_button,
+            command=self.toggle_theme_mode_button,
         )
         self.theme_toggle_btn.pack(side=tk.RIGHT, anchor="ne")
         ttk.Label(header, text="AFKScope", font=("Segoe UI", 12, "bold")).pack(anchor="center")
@@ -623,16 +625,55 @@ class AntiAfkApp:
 
     def _update_theme_toggle_icon(self) -> None:
         if hasattr(self, "theme_toggle_btn"):
-            self.theme_toggle_btn.configure(text="\u263e" if self.dark_mode_var.get() else "\u2600")
+            mode = self.theme_mode_var.get()
+            if mode == "dark":
+                self.theme_toggle_btn.configure(text="\u263e")
+            elif mode == "light":
+                self.theme_toggle_btn.configure(text="\u2600")
+            else:
+                self.theme_toggle_btn.configure(text="A")
 
-    def toggle_dark_mode(self) -> None:
-        target = 1.0 if self.dark_mode_var.get() else 0.0
+    def _detect_system_dark_mode(self) -> bool:
+        if os.name != "nt":
+            return False
+        try:
+            import winreg
+
+            key_path = r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize"
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, key_path) as key:
+                value, _ = winreg.QueryValueEx(key, "AppsUseLightTheme")
+            return int(value) == 0
+        except Exception:
+            return False
+
+    def _effective_dark_mode(self) -> bool:
+        mode = self.theme_mode_var.get()
+        if mode == "dark":
+            return True
+        if mode == "light":
+            return False
+        return self._detect_system_dark_mode()
+
+    def _apply_current_theme_mode(self, animated: bool = True) -> None:
+        is_dark = self._effective_dark_mode()
+        self.dark_mode_var.set(is_dark)
+        target = 1.0 if is_dark else 0.0
         self._update_theme_toggle_icon()
-        self._animate_theme_to(target)
+        if animated:
+            self._animate_theme_to(target)
+        else:
+            self.current_theme_t = target
+            self._apply_theme(self._theme_at(self.current_theme_t))
 
-    def toggle_dark_mode_button(self) -> None:
-        self.dark_mode_var.set(not self.dark_mode_var.get())
-        self.toggle_dark_mode()
+    def toggle_theme_mode_button(self) -> None:
+        order = ("system", "light", "dark")
+        current = self.theme_mode_var.get()
+        try:
+            idx = order.index(current)
+        except ValueError:
+            idx = 0
+        self.theme_mode_var.set(order[(idx + 1) % len(order)])
+        self._apply_current_theme_mode(animated=True)
 
     @staticmethod
     def _pick_text_color(bg_hex: str) -> str:
@@ -1595,6 +1636,13 @@ class AntiAfkApp:
         self._poll_biome_tracker()
         self.root.after(2500, self._schedule_instance_poll)
 
+    def _schedule_system_theme_poll(self) -> None:
+        if self.theme_mode_var.get() == "system":
+            target = 1.0 if self._effective_dark_mode() else 0.0
+            if abs(target - self.current_theme_t) > 0.01:
+                self._apply_current_theme_mode(animated=True)
+        self.system_theme_poll_after_id = self.root.after(3000, self._schedule_system_theme_poll)
+
     def _enabled_by_pid_snapshot(self) -> dict[int, bool]:
         mapping: dict[int, bool] = {}
         for hwnd, _title, pid, _pname in self.window_map:
@@ -1614,6 +1662,7 @@ class AntiAfkApp:
             "webhook_url": self.webhook_url_var.get().strip(),
             "watchdog_enabled": bool(self.watchdog_enabled_var.get()),
             "watchdog_threshold": self.watchdog_threshold_var.get().strip(),
+            "theme_mode": self.theme_mode_var.get(),
             "dark_mode": bool(self.dark_mode_var.get()),
             "biome_alerts_enabled": bool(self.biome_alerts_enabled_var.get()),
             "rare_biome": self.rare_biome_var.get().strip().upper(),
@@ -1642,12 +1691,14 @@ class AntiAfkApp:
         self.webhook_url_var.set(str(data.get("webhook_url", "")))
         self.watchdog_enabled_var.set(bool(data.get("watchdog_enabled", True)))
         self.watchdog_threshold_var.set(str(data.get("watchdog_threshold", "12")))
-        self.dark_mode_var.set(bool(data.get("dark_mode", False)))
+        theme_mode = str(data.get("theme_mode", "")).strip().lower()
+        if theme_mode not in {"light", "dark", "system"}:
+            theme_mode = "dark" if bool(data.get("dark_mode", False)) else "light"
+        self.theme_mode_var.set(theme_mode)
+        self.dark_mode_var.set(self._effective_dark_mode())
         self.biome_alerts_enabled_var.set(bool(data.get("biome_alerts_enabled", False)))
         self.rare_biome_var.set(str(data.get("rare_biome", "GLITCHED")).strip().upper() or "GLITCHED")
-        self.current_theme_t = 1.0 if self.dark_mode_var.get() else 0.0
-        self._update_theme_toggle_icon()
-        self._apply_theme(self._theme_at(self.current_theme_t))
+        self._apply_current_theme_mode(animated=False)
         self.refresh_instance_list(manual=False)
 
     @staticmethod
@@ -1731,6 +1782,7 @@ class AntiAfkApp:
             f"Roblox windows detected: {len(windows)}",
             f"Biome log source: {latest_log}",
             f"Current biome: {self.current_biome_name} ({self.current_biome_source})",
+            f"Theme mode: {self.theme_mode_var.get()} ({'dark' if self.dark_mode_var.get() else 'light'})",
             f"Webhook configured: {'YES' if webhook_on else 'NO'}",
             f"Rare biome alerts: {'ON' if self.biome_alerts_enabled_var.get() else 'OFF'} ({self.rare_biome_var.get().strip().upper() or 'GLITCHED'})",
             f"Session errors: {self.session_errors}",
@@ -1922,6 +1974,12 @@ class AntiAfkApp:
     def on_close(self) -> None:
         self.stop()
         self.save_config()
+        if self.system_theme_poll_after_id:
+            self.root.after_cancel(self.system_theme_poll_after_id)
+            self.system_theme_poll_after_id = None
+        if self.theme_animation_after_id:
+            self.root.after_cancel(self.theme_animation_after_id)
+            self.theme_animation_after_id = None
         if self.tray_icon is not None:
             self.tray_icon.stop()
             self.tray_icon = None
