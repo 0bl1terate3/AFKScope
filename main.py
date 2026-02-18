@@ -8,6 +8,7 @@ import os
 import queue
 import random
 import re
+import struct
 import subprocess
 import sys
 import threading
@@ -103,7 +104,7 @@ BIOME_ALIAS_MAP: dict[str, str] = {
     "aurora": "AURORA",
 }
 
-APP_VERSION = "0.1.3"
+APP_VERSION = "0.1.4"
 APP_NAME = "StayActive"
 APP_USER_AGENT = f"{APP_NAME}/{APP_VERSION}"
 APP_ICON_ICO = "STAYACTIVE ICON.ico"
@@ -113,6 +114,64 @@ WM_HOTKEY = 0x0312
 PM_REMOVE = 0x0001
 MOD_ALT = 0x0001
 MOD_CONTROL = 0x0002
+DELETE_ACCESS = 0x00010000
+EVENT_MODIFY_STATE = 0x0002
+EVENT_ALL_ACCESS = 0x1F0003
+SYNCHRONIZE = 0x00100000
+ERROR_FILE_NOT_FOUND = 2
+ERROR_ACCESS_DENIED = 5
+PROCESS_DUP_HANDLE = 0x0040
+DUPLICATE_CLOSE_SOURCE = 0x00000001
+DUPLICATE_SAME_ACCESS = 0x00000002
+TOKEN_QUERY = 0x0008
+TOKEN_ADJUST_PRIVILEGES = 0x0020
+SE_PRIVILEGE_ENABLED = 0x00000002
+ERROR_NOT_ALL_ASSIGNED = 1300
+SYSTEM_EXTENDED_HANDLE_INFORMATION_CLASS = 64
+SYSTEM_HANDLE_INFORMATION_CLASS = 16
+OBJECT_NAME_INFORMATION_CLASS = 1
+OBJECT_TYPE_INFORMATION_CLASS = 2
+STATUS_SUCCESS = 0
+STATUS_INFO_LENGTH_MISMATCH = 0xC0000004
+STATUS_BUFFER_OVERFLOW = 0x80000005
+STATUS_BUFFER_TOO_SMALL = 0xC0000023
+TH32CS_SNAPPROCESS = 0x00000002
+INVALID_HANDLE_VALUE = ctypes.c_void_p(-1).value
+
+
+class _UNICODE_STRING(ctypes.Structure):
+    _fields_ = [
+        ("Length", wintypes.USHORT),
+        ("MaximumLength", wintypes.USHORT),
+        ("Buffer", wintypes.LPWSTR),
+    ]
+
+
+class _LUID(ctypes.Structure):
+    _fields_ = [("LowPart", wintypes.DWORD), ("HighPart", wintypes.LONG)]
+
+
+class _LUID_AND_ATTRIBUTES(ctypes.Structure):
+    _fields_ = [("Luid", _LUID), ("Attributes", wintypes.DWORD)]
+
+
+class _TOKEN_PRIVILEGES(ctypes.Structure):
+    _fields_ = [("PrivilegeCount", wintypes.DWORD), ("Privileges", _LUID_AND_ATTRIBUTES * 1)]
+
+
+class _PROCESSENTRY32W(ctypes.Structure):
+    _fields_ = [
+        ("dwSize", wintypes.DWORD),
+        ("cntUsage", wintypes.DWORD),
+        ("th32ProcessID", wintypes.DWORD),
+        ("th32DefaultHeapID", ctypes.c_size_t),
+        ("th32ModuleID", wintypes.DWORD),
+        ("cntThreads", wintypes.DWORD),
+        ("th32ParentProcessID", wintypes.DWORD),
+        ("pcPriClassBase", wintypes.LONG),
+        ("dwFlags", wintypes.DWORD),
+        ("szExeFile", wintypes.WCHAR * 260),
+    ]
 
 
 class AntiAfkApp:
@@ -123,6 +182,15 @@ class AntiAfkApp:
         else:
             base_path = os.path.dirname(os.path.abspath(__file__))
         return os.path.join(base_path, relative_name)
+
+    @staticmethod
+    def _current_process_pseudo_handle() -> wintypes.HANDLE:
+        # Stable pseudo-handle for current process across ctypes call boundaries.
+        return wintypes.HANDLE(-1)
+
+    @staticmethod
+    def _ntstatus_unsigned(status: int) -> int:
+        return ctypes.c_ulong(status).value
 
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
@@ -137,8 +205,10 @@ class AntiAfkApp:
         except Exception:
             pass
 
-        self.user32 = ctypes.windll.user32
-        self.kernel32 = ctypes.windll.kernel32
+        self.user32 = ctypes.WinDLL("user32", use_last_error=True)
+        self.kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        self.ntdll = ctypes.WinDLL("ntdll", use_last_error=True)
+        self.advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
 
         self.worker_thread: threading.Thread | None = None
         self.stop_event = threading.Event()
@@ -227,10 +297,21 @@ class AntiAfkApp:
 
         self.pid_username: dict[int, str] = {}
         self.pid_user_id: dict[int, int] = {}
+        self.pid_log_hint: dict[int, str] = {}
         self.pid_avatar_photo: dict[int, tk.PhotoImage] = {}
         self.pid_identity_confidence: dict[int, str] = {}
         self.identity_lookup_inflight: set[int] = set()
         self.identity_last_attempt: dict[int, float] = {}
+        self.singleton_cleanup_last_attempt_by_pid: dict[int, float] = {}
+        self.singleton_cleanup_attempt_interval_seconds = 10.0
+        self.singleton_cleanup_last_outcome_by_pid: dict[int, str] = {}
+        self.debug_privilege_checked = False
+        self.debug_privilege_enabled = False
+        self.debug_privilege_last_error: int = 0
+        self.debug_privilege_last_stage: str = ""
+        self.singleton_scan_last_entries = 0
+        self.singleton_scan_last_open_process_ok = 0
+        self.singleton_scan_last_open_process_fail = 0
 
         self.layout_cache: dict[int, tuple[int, int, int, int, int]] = {}
         self.last_window_count = -1
@@ -292,11 +373,14 @@ class AntiAfkApp:
         self.instance_priority_var: tk.StringVar | None = None
 
         self.username_patterns = [
-            re.compile(r'displayName["\s:]+([A-Za-z0-9_]{3,20})'),
-            re.compile(r'"name"\s*:\s*"([A-Za-z0-9_]{3,20})"'),
-            re.compile(r'Players\.([A-Za-z0-9_]{3,20})'),
-            re.compile(r'user(?:name)?["\s:]+([A-Za-z0-9_]{3,20})', re.IGNORECASE),
+            # MultiScope-style signal from Roblox logs; usually the cleanest identity marker.
+            re.compile(r"Players\.([A-Za-z0-9_]{3,20})\.PlayerGui", re.IGNORECASE),
+            re.compile(r"Player added:\s+([A-Za-z0-9_]{3,20})\s+\d+", re.IGNORECASE),
         ]
+        self.user_id_patterns = (
+            re.compile(r"\buserid:(\d+)\b", re.IGNORECASE),
+            re.compile(r"\buser:(\d+)\b", re.IGNORECASE),
+        )
         self.excluded_usernames = {
             "players",
             "roblox",
@@ -308,6 +392,14 @@ class AntiAfkApp:
             "character",
             "startergui",
             "replicatedstorage",
+            "telemetryreliability",
+            "key",
+            "value",
+            "event",
+            "state",
+            "data",
+            "result",
+            "payload",
         }
 
         self.current_biome_name = "Unknown"
@@ -378,6 +470,16 @@ class AntiAfkApp:
     def _finish_startup(self) -> None:
         # Defer startup work so the UI appears even if environment checks are slow.
         try:
+            runtime_path = sys.executable if getattr(sys, "frozen", False) else os.path.abspath(__file__)
+            self.log(f"Runtime binary: {runtime_path}")
+            debug_ok = self._ensure_debug_privilege()
+            if debug_ok:
+                self.log("SeDebugPrivilege enabled at startup.")
+            else:
+                self.log(
+                    "SeDebugPrivilege unavailable at startup "
+                    f"(run elevated; stage={self.debug_privilege_last_stage}, error={self.debug_privilege_last_error})."
+                )
             self.refresh_instance_list(manual=False)
             self.run_diagnostics_checks()
             self._set_global_hotkeys_enabled(self.hotkeys_enabled_var.get(), log_result=False)
@@ -1180,7 +1282,8 @@ class AntiAfkApp:
         if var is None:
             return
         initial = var.get().strip() if self._is_valid_theme_color(var.get()) else self.current_palette.get(key, "#000000")
-        _rgb, picked = colorchooser.askcolor(color=initial, parent=self.theme_maker_window)
+        parent = self.theme_maker_window if self.theme_maker_window is not None else self.root
+        _rgb, picked = colorchooser.askcolor(color=initial, parent=parent)
         if picked:
             var.set(picked.lower())
             self._theme_maker_update_swatch(key)
@@ -2211,8 +2314,594 @@ class AntiAfkApp:
         finally:
             self.kernel32.CloseHandle(handle)
 
+    @staticmethod
+    def _singleton_event_names_for_session(session_id: int | None) -> tuple[str, ...]:
+        names = {
+            "Local\\ROBLOX_singletonEvent",
+            "Global\\ROBLOX_singletonEvent",
+            "ROBLOX_singletonEvent",
+        }
+        if session_id is not None and session_id >= 0:
+            names.add(f"\\Sessions\\{session_id}\\BaseNamedObjects\\ROBLOX_singletonEvent")
+            names.add(f"Sessions\\{session_id}\\BaseNamedObjects\\ROBLOX_singletonEvent")
+        return tuple(names)
+
+    def _current_session_id(self) -> int | None:
+        session_id = wintypes.DWORD(0)
+        ok = self.kernel32.ProcessIdToSessionId(wintypes.DWORD(os.getpid()), ctypes.byref(session_id))
+        if not ok:
+            return None
+        return int(session_id.value)
+
+    def _singleton_event_names(self) -> tuple[str, ...]:
+        return self._singleton_event_names_for_session(self._current_session_id())
+
+    def _all_roblox_process_pids(self) -> set[int]:
+        pids: set[int] = set()
+        candidate_names = {
+            "robloxplayerbeta.exe",
+            "windows10universal.exe",
+            "robloxplayerlauncher.exe",
+        }
+        create_snapshot = self.kernel32.CreateToolhelp32Snapshot
+        create_snapshot.argtypes = [wintypes.DWORD, wintypes.DWORD]
+        create_snapshot.restype = wintypes.HANDLE
+        process_first = self.kernel32.Process32FirstW
+        process_first.argtypes = [wintypes.HANDLE, ctypes.POINTER(_PROCESSENTRY32W)]
+        process_first.restype = wintypes.BOOL
+        process_next = self.kernel32.Process32NextW
+        process_next.argtypes = [wintypes.HANDLE, ctypes.POINTER(_PROCESSENTRY32W)]
+        process_next.restype = wintypes.BOOL
+
+        snapshot = create_snapshot(TH32CS_SNAPPROCESS, 0)
+        if snapshot == INVALID_HANDLE_VALUE or not snapshot:
+            return pids
+        try:
+            entry = _PROCESSENTRY32W()
+            entry.dwSize = ctypes.sizeof(_PROCESSENTRY32W)
+            ok = bool(process_first(snapshot, ctypes.byref(entry)))
+            while ok:
+                image_name = str(entry.szExeFile).strip().lower()
+                if image_name in candidate_names:
+                    pids.add(int(entry.th32ProcessID))
+                ok = bool(process_next(snapshot, ctypes.byref(entry)))
+        except Exception:
+            return pids
+        finally:
+            self.kernel32.CloseHandle(snapshot)
+        return pids
+
+    def _nt_query_object_text(self, handle: int, info_class: int) -> str | None:
+        nt_query_object = getattr(self.ntdll, "NtQueryObject", None)
+        if nt_query_object is None:
+            return None
+        nt_query_object.argtypes = [wintypes.HANDLE, wintypes.ULONG, ctypes.c_void_p, wintypes.ULONG, ctypes.POINTER(wintypes.ULONG)]
+        nt_query_object.restype = ctypes.c_long
+
+        needed = wintypes.ULONG(0)
+        status = self._ntstatus_unsigned(int(nt_query_object(handle, info_class, None, 0, ctypes.byref(needed))))
+        if status not in {STATUS_INFO_LENGTH_MISMATCH, STATUS_BUFFER_OVERFLOW, STATUS_BUFFER_TOO_SMALL}:
+            return None
+        size = max(needed.value, 512)
+        buffer = ctypes.create_string_buffer(size)
+        status = self._ntstatus_unsigned(int(nt_query_object(handle, info_class, buffer, size, ctypes.byref(needed))))
+        if status != STATUS_SUCCESS:
+            return None
+        try:
+            ustr = ctypes.cast(buffer, ctypes.POINTER(_UNICODE_STRING)).contents
+            if not ustr.Buffer or ustr.Length <= 0:
+                return ""
+            return ctypes.wstring_at(ustr.Buffer, int(ustr.Length // 2))
+        except Exception:
+            return None
+
+    def _query_object_type_name(self, handle: int) -> str | None:
+        return self._nt_query_object_text(handle, OBJECT_TYPE_INFORMATION_CLASS)
+
+    def _query_object_name(self, handle: int) -> str | None:
+        return self._nt_query_object_text(handle, OBJECT_NAME_INFORMATION_CLASS)
+
+    def _enumerate_system_handle_entries(self) -> list[tuple[int, int, int]]:
+        entries = self._enumerate_system_handle_entries_extended()
+        if entries:
+            return entries
+        # Fallback for environments where class 64 yields no parsable data.
+        return self._enumerate_system_handle_entries_legacy()
+
+    def _enumerate_system_handle_entries_extended(self) -> list[tuple[int, int, int]]:
+        nt_query_system_information = getattr(self.ntdll, "NtQuerySystemInformation", None)
+        if nt_query_system_information is None:
+            return []
+        nt_query_system_information.argtypes = [
+            wintypes.ULONG,
+            ctypes.c_void_p,
+            wintypes.ULONG,
+            ctypes.POINTER(wintypes.ULONG),
+        ]
+        nt_query_system_information.restype = ctypes.c_long
+
+        size = 0x20000
+        needed = wintypes.ULONG(0)
+        while True:
+            buffer = ctypes.create_string_buffer(size)
+            status = self._ntstatus_unsigned(int(
+                nt_query_system_information(
+                    SYSTEM_EXTENDED_HANDLE_INFORMATION_CLASS,
+                    buffer,
+                    size,
+                    ctypes.byref(needed),
+                )
+            ))
+            if status == STATUS_SUCCESS:
+                break
+            if status not in {STATUS_INFO_LENGTH_MISMATCH, STATUS_BUFFER_OVERFLOW, STATUS_BUFFER_TOO_SMALL}:
+                return []
+            size = max(size * 2, int(needed.value) + 0x10000)
+            if size > 64 * 1024 * 1024:
+                return []
+
+        raw = ctypes.string_at(buffer, size)
+        ptr_size = ctypes.sizeof(ctypes.c_void_p)
+        if len(raw) < ptr_size * 2:
+            return []
+
+        if ptr_size == 8:
+            count = struct.unpack_from("<Q", raw, 0)[0]
+            entry_fmt = "<QQQIHHII"
+        else:
+            count = struct.unpack_from("<I", raw, 0)[0]
+            entry_fmt = "<IIIIHHII"
+        entry_size = struct.calcsize(entry_fmt)
+        offset = ptr_size * 2
+        max_entries_by_size = (len(raw) - offset) // entry_size
+        total = int(min(count, max_entries_by_size))
+
+        entries: list[tuple[int, int, int]] = []
+        for index in range(total):
+            base = offset + (index * entry_size)
+            parsed = struct.unpack_from(entry_fmt, raw, base)
+            object_ptr = int(parsed[0])
+            owner_pid = int(parsed[1])
+            handle_value = int(parsed[2])
+            if handle_value:
+                entries.append((object_ptr, owner_pid, handle_value))
+        return entries
+
+    def _enumerate_system_handle_entries_legacy(self) -> list[tuple[int, int, int]]:
+        nt_query_system_information = getattr(self.ntdll, "NtQuerySystemInformation", None)
+        if nt_query_system_information is None:
+            return []
+        nt_query_system_information.argtypes = [
+            wintypes.ULONG,
+            ctypes.c_void_p,
+            wintypes.ULONG,
+            ctypes.POINTER(wintypes.ULONG),
+        ]
+        nt_query_system_information.restype = ctypes.c_long
+
+        size = 0x10000
+        needed = wintypes.ULONG(0)
+        while True:
+            buffer = ctypes.create_string_buffer(size)
+            status = self._ntstatus_unsigned(int(
+                nt_query_system_information(
+                    SYSTEM_HANDLE_INFORMATION_CLASS,
+                    buffer,
+                    size,
+                    ctypes.byref(needed),
+                )
+            ))
+            if status == STATUS_SUCCESS:
+                break
+            if status not in {STATUS_INFO_LENGTH_MISMATCH, STATUS_BUFFER_OVERFLOW, STATUS_BUFFER_TOO_SMALL}:
+                return []
+            size = max(size * 2, int(needed.value) + 0x4000)
+            if size > 64 * 1024 * 1024:
+                return []
+
+        raw = ctypes.string_at(buffer, size)
+        if len(raw) < 4:
+            return []
+        count = struct.unpack_from("<I", raw, 0)[0]
+        ptr_size = ctypes.sizeof(ctypes.c_void_p)
+        if ptr_size == 8:
+            entry_fmt = "<HHBBHQI4x"
+            offsets = (8, 4)
+        else:
+            entry_fmt = "<HHBBHII"
+            offsets = (4,)
+        entry_size = struct.calcsize(entry_fmt)
+
+        for offset in offsets:
+            if len(raw) <= offset:
+                continue
+            max_entries_by_size = (len(raw) - offset) // entry_size
+            total = int(min(count, max_entries_by_size))
+            if total <= 0:
+                continue
+            out: list[tuple[int, int, int]] = []
+            for index in range(total):
+                base = offset + (index * entry_size)
+                parsed = struct.unpack_from(entry_fmt, raw, base)
+                owner_pid = int(parsed[0])
+                handle_value = int(parsed[4])
+                object_ptr = int(parsed[5])
+                if handle_value:
+                    out.append((object_ptr, owner_pid, handle_value))
+            if out:
+                return out
+        return []
+
+    def _enumerate_system_handles_for_pid(self, pid: int) -> list[int]:
+        return [handle for _obj, owner_pid, handle in self._enumerate_system_handle_entries() if owner_pid == pid]
+
+    def _singleton_event_object_ids(self) -> set[int]:
+        open_event = self.kernel32.OpenEventW
+        open_event.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.LPCWSTR]
+        open_event.restype = wintypes.HANDLE
+        this_pid = os.getpid()
+        opened_handles: list[int] = []
+        for name in self._singleton_event_names():
+            handle = open_event(SYNCHRONIZE, False, name)
+            if handle:
+                opened_handles.append(int(handle))
+        if not opened_handles:
+            return set()
+
+        entries = self._enumerate_system_handle_entries()
+        object_ids: set[int] = set()
+        try:
+            for raw_handle in opened_handles:
+                for object_ptr, owner_pid, handle_value in entries:
+                    if owner_pid == this_pid and handle_value == raw_handle and object_ptr:
+                        object_ids.add(object_ptr)
+                        break
+        finally:
+            for raw_handle in opened_handles:
+                self.kernel32.CloseHandle(wintypes.HANDLE(raw_handle))
+        return object_ids
+
+    def _ensure_debug_privilege(self) -> bool:
+        if self.debug_privilege_checked:
+            return self.debug_privilege_enabled
+        self.debug_privilege_checked = True
+        self.debug_privilege_last_error = 0
+        self.debug_privilege_last_stage = ""
+        token = wintypes.HANDLE(0)
+        ctypes.set_last_error(0)
+        open_ok = self.advapi32.OpenProcessToken(
+            self._current_process_pseudo_handle(),
+            TOKEN_QUERY | TOKEN_ADJUST_PRIVILEGES,
+            ctypes.byref(token),
+        )
+        if not open_ok or not token.value:
+            self.debug_privilege_last_stage = "OpenProcessToken"
+            self.debug_privilege_last_error = int(ctypes.get_last_error())
+            return False
+        try:
+            luid = _LUID()
+            name = ctypes.c_wchar_p("SeDebugPrivilege")
+            ctypes.set_last_error(0)
+            lookup_ok = self.advapi32.LookupPrivilegeValueW(None, name, ctypes.byref(luid))
+            if not lookup_ok:
+                self.debug_privilege_last_stage = "LookupPrivilegeValueW"
+                self.debug_privilege_last_error = int(ctypes.get_last_error())
+                return False
+            token_privileges = _TOKEN_PRIVILEGES()
+            token_privileges.PrivilegeCount = 1
+            token_privileges.Privileges[0].Luid = luid
+            token_privileges.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED
+            ctypes.set_last_error(0)
+            adjust_ok = self.advapi32.AdjustTokenPrivileges(
+                token,
+                False,
+                ctypes.byref(token_privileges),
+                0,
+                None,
+                None,
+            )
+            if not adjust_ok:
+                self.debug_privilege_last_stage = "AdjustTokenPrivileges"
+                self.debug_privilege_last_error = int(ctypes.get_last_error())
+                return False
+            self.debug_privilege_last_error = int(ctypes.get_last_error())
+            if self.debug_privilege_last_error == ERROR_NOT_ALL_ASSIGNED:
+                self.debug_privilege_last_stage = "AdjustTokenPrivileges/NotAssigned"
+                return False
+            self.debug_privilege_enabled = True
+            return True
+        finally:
+            self.kernel32.CloseHandle(token)
+
+    def _close_singleton_event_handles_for_pids(self, pids: set[int]) -> tuple[int, int]:
+        if not pids:
+            return 0, 0
+        self._ensure_debug_privilege()
+        target_object_ids = self._singleton_event_object_ids()
+        entries = self._enumerate_system_handle_entries()
+        current_process = self._current_process_pseudo_handle()
+        source_handles: dict[int, int] = {}
+        matched = 0
+        closed = 0
+        try:
+            for object_ptr, owner_pid, handle_value in entries:
+                if owner_pid not in pids or object_ptr not in target_object_ids:
+                    continue
+                source_handle = source_handles.get(owner_pid)
+                if source_handle is None:
+                    source_handle = int(self.kernel32.OpenProcess(PROCESS_DUP_HANDLE, False, owner_pid))
+                    source_handles[owner_pid] = source_handle
+                if not source_handle:
+                    continue
+                matched += 1
+                closed_dup = wintypes.HANDLE(0)
+                close_ok = self.kernel32.DuplicateHandle(
+                    wintypes.HANDLE(source_handle),
+                    wintypes.HANDLE(handle_value),
+                    current_process,
+                    ctypes.byref(closed_dup),
+                    0,
+                    False,
+                    DUPLICATE_SAME_ACCESS | DUPLICATE_CLOSE_SOURCE,
+                )
+                if close_ok:
+                    closed += 1
+                    if closed_dup.value:
+                        self.kernel32.CloseHandle(closed_dup)
+        finally:
+            for handle in source_handles.values():
+                if handle:
+                    self.kernel32.CloseHandle(wintypes.HANDLE(handle))
+        if matched == 0 and target_object_ids:
+            return closed, matched
+        if matched == 0:
+            # Fallback: match by duplicated-handle object name like Process Explorer handle search.
+            return self._close_named_singleton_event_handles_for_pids(pids)
+        return closed, matched
+
+    def _close_named_singleton_event_handles_for_pids(self, pids: set[int]) -> tuple[int, int]:
+        entries = self._enumerate_system_handle_entries()
+        current_process = self._current_process_pseudo_handle()
+        source_handles: dict[int, int] = {}
+        matched = 0
+        closed = 0
+        try:
+            for _object_ptr, owner_pid, handle_value in entries:
+                if owner_pid not in pids:
+                    continue
+                source_handle = source_handles.get(owner_pid)
+                if source_handle is None:
+                    source_handle = int(self.kernel32.OpenProcess(PROCESS_DUP_HANDLE, False, owner_pid))
+                    source_handles[owner_pid] = source_handle
+                if not source_handle:
+                    continue
+                duplicated = wintypes.HANDLE(0)
+                dup_ok = self.kernel32.DuplicateHandle(
+                    wintypes.HANDLE(source_handle),
+                    wintypes.HANDLE(handle_value),
+                    current_process,
+                    ctypes.byref(duplicated),
+                    0,
+                    False,
+                    DUPLICATE_SAME_ACCESS,
+                )
+                if not dup_ok or not duplicated.value:
+                    continue
+                try:
+                    obj_type = self._query_object_type_name(int(duplicated.value))
+                    if not obj_type or obj_type.strip().lower() != "event":
+                        continue
+                    obj_name = self._query_object_name(int(duplicated.value)) or ""
+                    if "roblox_singletonevent" not in obj_name.lower():
+                        continue
+                    matched += 1
+                    closed_dup = wintypes.HANDLE(0)
+                    close_ok = self.kernel32.DuplicateHandle(
+                        wintypes.HANDLE(source_handle),
+                        wintypes.HANDLE(handle_value),
+                        current_process,
+                        ctypes.byref(closed_dup),
+                        0,
+                        False,
+                        DUPLICATE_SAME_ACCESS | DUPLICATE_CLOSE_SOURCE,
+                    )
+                    if close_ok:
+                        closed += 1
+                        if closed_dup.value:
+                            self.kernel32.CloseHandle(closed_dup)
+                finally:
+                    self.kernel32.CloseHandle(duplicated)
+        finally:
+            for handle in source_handles.values():
+                if handle:
+                    self.kernel32.CloseHandle(wintypes.HANDLE(handle))
+        return closed, matched
+
+    def _close_named_singleton_event_handles_globally(self) -> tuple[int, int]:
+        # Process Explorer-style behavior: search all process handles by object name
+        # and close matching source handles directly with DUPLICATE_CLOSE_SOURCE.
+        entries = self._enumerate_system_handle_entries()
+        self.singleton_scan_last_entries = len(entries)
+        self.singleton_scan_last_open_process_ok = 0
+        self.singleton_scan_last_open_process_fail = 0
+        current_process = self._current_process_pseudo_handle()
+        source_handles: dict[int, int] = {}
+        matched = 0
+        closed = 0
+        try:
+            for _object_ptr, owner_pid, handle_value in entries:
+                source_handle = source_handles.get(owner_pid)
+                if source_handle is None:
+                    source_handle = int(self.kernel32.OpenProcess(PROCESS_DUP_HANDLE, False, owner_pid))
+                    if source_handle:
+                        self.singleton_scan_last_open_process_ok += 1
+                    else:
+                        self.singleton_scan_last_open_process_fail += 1
+                    source_handles[owner_pid] = source_handle
+                if not source_handle:
+                    continue
+                duplicated = wintypes.HANDLE(0)
+                dup_ok = self.kernel32.DuplicateHandle(
+                    wintypes.HANDLE(source_handle),
+                    wintypes.HANDLE(handle_value),
+                    current_process,
+                    ctypes.byref(duplicated),
+                    0,
+                    False,
+                    DUPLICATE_SAME_ACCESS,
+                )
+                if not dup_ok or not duplicated.value:
+                    continue
+                try:
+                    obj_type = self._query_object_type_name(int(duplicated.value))
+                    if not obj_type or obj_type.strip().lower() != "event":
+                        continue
+                    obj_name = self._query_object_name(int(duplicated.value)) or ""
+                    if "roblox_singletonevent" not in obj_name.lower():
+                        continue
+                    matched += 1
+                    closed_dup = wintypes.HANDLE(0)
+                    close_ok = self.kernel32.DuplicateHandle(
+                        wintypes.HANDLE(source_handle),
+                        wintypes.HANDLE(handle_value),
+                        current_process,
+                        ctypes.byref(closed_dup),
+                        0,
+                        False,
+                        DUPLICATE_SAME_ACCESS | DUPLICATE_CLOSE_SOURCE,
+                    )
+                    if close_ok:
+                        closed += 1
+                        if closed_dup.value:
+                            self.kernel32.CloseHandle(closed_dup)
+                finally:
+                    self.kernel32.CloseHandle(duplicated)
+        finally:
+            for handle in source_handles.values():
+                if handle:
+                    self.kernel32.CloseHandle(wintypes.HANDLE(handle))
+        return closed, matched
+
+    def _close_singleton_event_handles_retry_window(self, duration_seconds: float = 2.0, interval_seconds: float = 0.25) -> tuple[int, int, int]:
+        total_closed = 0
+        total_matched = 0
+        passes = 0
+        deadline = time.perf_counter() + max(0.2, duration_seconds)
+        sleep_seconds = min(0.5, max(0.2, interval_seconds))
+        while time.perf_counter() < deadline:
+            passes += 1
+            closed, matched = self._close_named_singleton_event_handles_globally()
+            total_closed += closed
+            total_matched += matched
+            state = self._probe_roblox_singleton_event_state()
+            if state == "absent":
+                break
+            time.sleep(sleep_seconds)
+        return total_closed, total_matched, passes
+
+    def _probe_roblox_singleton_event_state(self) -> str:
+        open_event = self.kernel32.OpenEventW
+        open_event.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.LPCWSTR]
+        open_event.restype = wintypes.HANDLE
+        inaccessible_seen = False
+        for name in self._singleton_event_names():
+            ctypes.set_last_error(0)
+            handle = open_event(SYNCHRONIZE, False, name)
+            if handle:
+                self.kernel32.CloseHandle(handle)
+                return "present"
+            err = ctypes.get_last_error()
+            if err == ERROR_ACCESS_DENIED:
+                inaccessible_seen = True
+            if err == ERROR_FILE_NOT_FOUND:
+                continue
+        return "inaccessible" if inaccessible_seen else "absent"
+
+    def _try_delete_roblox_singleton_event_once(self) -> bool:
+        access_modes = (DELETE_ACCESS, DELETE_ACCESS | EVENT_MODIFY_STATE, EVENT_ALL_ACCESS)
+        nt_make_temporary = getattr(self.ntdll, "NtMakeTemporaryObject", None)
+        if nt_make_temporary is not None:
+            nt_make_temporary.argtypes = [wintypes.HANDLE]
+            nt_make_temporary.restype = ctypes.c_long
+        open_event = self.kernel32.OpenEventW
+        open_event.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.LPCWSTR]
+        open_event.restype = wintypes.HANDLE
+
+        for name in self._singleton_event_names():
+            for access in access_modes:
+                handle = open_event(access, False, name)
+                if not handle:
+                    continue
+                try:
+                    if nt_make_temporary is not None and int(nt_make_temporary(handle)) == 0:
+                        return True
+                finally:
+                    self.kernel32.CloseHandle(handle)
+        return False
+
+    def _auto_delete_roblox_singleton_event(self, pids: set[int]) -> None:
+        if not pids:
+            return
+        now = time.time()
+        due_pids = {
+            pid
+            for pid in pids
+            if (now - self.singleton_cleanup_last_attempt_by_pid.get(pid, 0.0))
+            >= self.singleton_cleanup_attempt_interval_seconds
+        }
+        if not due_pids:
+            return
+        for pid in due_pids:
+            self.singleton_cleanup_last_attempt_by_pid[pid] = now
+        before = self._probe_roblox_singleton_event_state()
+        attempt_ok = self._try_delete_roblox_singleton_event_once()
+        after = self._probe_roblox_singleton_event_state()
+        force_closed = 0
+        force_matched = 0
+        debug_ok = self._ensure_debug_privilege()
+        if after in {"present", "inaccessible"} and debug_ok:
+            force_closed, force_matched = self._close_singleton_event_handles_for_pids(due_pids)
+            after = self._probe_roblox_singleton_event_state()
+            if after in {"present", "inaccessible"}:
+                global_closed, global_matched, retry_passes = self._close_singleton_event_handles_retry_window(
+                    duration_seconds=2.0,
+                    interval_seconds=0.25,
+                )
+                force_closed += global_closed
+                force_matched += global_matched
+                after = self._probe_roblox_singleton_event_state()
+            else:
+                retry_passes = 0
+        else:
+            retry_passes = 0
+
+        if after == "absent":
+            outcome = "deleted_or_not_present"
+        elif after == "present":
+            outcome = "still_exists"
+        elif after == "inaccessible" and not debug_ok:
+            outcome = "debug_privilege_missing"
+        else:
+            outcome = "cannot_verify"
+
+        changed_pids = [pid for pid in sorted(due_pids) if self.singleton_cleanup_last_outcome_by_pid.get(pid) != outcome]
+        for pid in changed_pids:
+            self.singleton_cleanup_last_outcome_by_pid[pid] = outcome
+        if changed_pids:
+            pid_list = ",".join(str(pid) for pid in changed_pids)
+            self.log(
+                "Auto-cleanup PIDs "
+                f"[{pid_list}]: {outcome} "
+                f"(before={before}, attempt_ok={attempt_ok}, force_closed={force_closed}/{force_matched}, "
+                f"retry_passes={retry_passes}, after={after}, debug_priv={self.debug_privilege_enabled}, "
+                f"debug_stage={self.debug_privilege_last_stage}, debug_err={self.debug_privilege_last_error}, "
+                f"scan_entries={self.singleton_scan_last_entries}, openproc_ok={self.singleton_scan_last_open_process_ok}, "
+                f"openproc_fail={self.singleton_scan_last_open_process_fail})."
+            )
+
     def find_roblox_windows(self) -> list[tuple[int, str, int, str]]:
         windows: list[tuple[int, str, int, str]] = []
+        roblox_pids: set[int] = set()
         enum_proc = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
 
         def _enum_cb(hwnd: int, _lparam: int) -> bool:
@@ -2228,11 +2917,14 @@ class AntiAfkApp:
             process_name = self._get_process_name(pid)
             proc_lower = process_name.lower()
             if proc_lower in {"robloxplayerbeta.exe", "windows10universal.exe"}:
+                roblox_pids.add(pid)
                 windows.append((int(hwnd), title, pid, process_name))
             return True
 
         callback = enum_proc(_enum_cb)
         self.user32.EnumWindows(callback, 0)
+        roblox_pids.update(self._all_roblox_process_pids())
+        self._auto_delete_roblox_singleton_event(roblox_pids)
         return windows
 
     def _extract_username_from_text(self, text: str) -> str | None:
@@ -2244,6 +2936,38 @@ class AntiAfkApp:
             if username and username.lower() not in self.excluded_usernames:
                 return username
         return None
+
+    def _extract_username_candidates_from_text(self, text: str, max_results: int = 16) -> list[str]:
+        candidates: list[str] = []
+        seen: set[str] = set()
+        for pattern in self.username_patterns:
+            for match in pattern.finditer(text):
+                username = match.group(1).strip()
+                lower = username.lower()
+                if not username or lower in self.excluded_usernames or lower in seen:
+                    continue
+                seen.add(lower)
+                candidates.append(username)
+                if len(candidates) >= max_results:
+                    return candidates
+        return candidates
+
+    def _extract_user_id_candidates_from_text(self, text: str, max_results: int = 12) -> list[int]:
+        candidates: list[int] = []
+        seen: set[int] = set()
+        for pattern in self.user_id_patterns:
+            for match in pattern.finditer(text):
+                try:
+                    user_id = int(match.group(1))
+                except ValueError:
+                    continue
+                if user_id <= 0 or user_id in seen:
+                    continue
+                seen.add(user_id)
+                candidates.append(user_id)
+                if len(candidates) >= max_results:
+                    return candidates
+        return candidates
 
     def _find_candidate_logs_for_pid(self, pid: int) -> list[str]:
         local_app_data = os.getenv("LOCALAPPDATA", "")
@@ -2295,23 +3019,73 @@ class AntiAfkApp:
             if f"pid:{pid}" in header or f"PID: {pid}" in header:
                 ranked.append(full)
 
-        for _mtime, full in candidates[:25]:
-            if full not in ranked:
-                ranked.append(full)
+        hint = self.pid_log_hint.get(pid)
+        if hint and os.path.exists(hint):
+            ranked = [hint] + [p for p in ranked if p != hint]
+
+        if not ranked:
+            # Fallback for Roblox log formats that do not embed pid hints.
+            for _mtime, full in candidates[:60]:
+                name = os.path.basename(full)
+                if "_player_" in name.lower() and full not in ranked:
+                    ranked.append(full)
+                if len(ranked) >= 20:
+                    break
 
         return ranked
 
-    def _detect_username_for_pid(self, pid: int) -> tuple[str | None, str]:
+    def _detect_username_for_pid(self, pid: int) -> tuple[str | None, int | None, str]:
+        fallback_username: str | None = None
+        api_attempts = 0
+        api_attempt_limit = 12
         for log_path in self._find_candidate_logs_for_pid(pid):
             try:
                 with open(log_path, "r", encoding="utf-8", errors="ignore") as f:
                     text = f.read(2_000_000)
             except OSError:
                 continue
-            username = self._extract_username_from_text(text)
-            if username:
-                return username, "log"
-        return None, "unknown"
+            user_id_candidates = self._extract_user_id_candidates_from_text(text)
+            user_id_set = set(user_id_candidates)
+            username_candidates = self._extract_username_candidates_from_text(text)
+            if fallback_username is None and username_candidates:
+                fallback_username = username_candidates[0]
+
+            # Best-effort pairing: if log has both username-like and userid-like signals,
+            # keep only usernames that resolve to one of the observed user IDs.
+            for username in username_candidates:
+                if api_attempts >= api_attempt_limit:
+                    break
+                api_attempts += 1
+                resolved_user_id = self._resolve_user_id(username)
+                if resolved_user_id is None:
+                    continue
+                if user_id_set and resolved_user_id not in user_id_set:
+                    continue
+                if any(other_pid != pid and other_uid == resolved_user_id for other_pid, other_uid in self.pid_user_id.items()):
+                    continue
+                self.pid_log_hint[pid] = log_path
+                return username, resolved_user_id, "api"
+
+            for user_id in user_id_candidates:
+                if any(other_pid != pid and other_uid == user_id for other_pid, other_uid in self.pid_user_id.items()):
+                    continue
+                resolved_name = self._resolve_username_from_user_id(user_id)
+                if resolved_name:
+                    self.pid_log_hint[pid] = log_path
+                    return resolved_name, user_id, "api"
+            for username in username_candidates:
+                if api_attempts >= api_attempt_limit:
+                    break
+                api_attempts += 1
+                user_id = self._resolve_user_id(username)
+                if user_id is not None:
+                    if any(other_pid != pid and other_uid == user_id for other_pid, other_uid in self.pid_user_id.items()):
+                        continue
+                    self.pid_log_hint[pid] = log_path
+                    return username, user_id, "api"
+        if fallback_username is not None:
+            return fallback_username, None, "log"
+        return None, None, "unknown"
 
     @staticmethod
     def _fetch_json(url: str, method: str = "GET", body: bytes | None = None) -> dict[str, Any] | None:
@@ -2342,6 +3116,18 @@ class AntiAfkApp:
             return None
         user_id = first.get("id")
         return int(user_id) if isinstance(user_id, int) else None
+
+    def _resolve_username_from_user_id(self, user_id: int) -> str | None:
+        data = self._fetch_json(f"https://users.roblox.com/v1/users/{user_id}")
+        if not data:
+            return None
+        username = data.get("name")
+        if not isinstance(username, str):
+            return None
+        username = username.strip()
+        if not username or username.lower() in self.excluded_usernames:
+            return None
+        return username
 
     def _resolve_avatar_bytes(self, user_id: int) -> bytes | None:
         url = (
@@ -2375,14 +3161,10 @@ class AntiAfkApp:
         threading.Thread(target=self._identity_lookup_worker, args=(pid,), daemon=True).start()
 
     def _identity_lookup_worker(self, pid: int) -> None:
-        username, confidence = self._detect_username_for_pid(pid)
-        user_id: int | None = None
+        username, user_id, confidence = self._detect_username_for_pid(pid)
         avatar_bytes: bytes | None = None
-        if username:
-            user_id = self._resolve_user_id(username)
-            if user_id is not None:
-                confidence = "api"
-                avatar_bytes = self._resolve_avatar_bytes(user_id)
+        if user_id is not None:
+            avatar_bytes = self._resolve_avatar_bytes(user_id)
         self.root.after(0, lambda: self._apply_identity_result(pid, username, user_id, confidence, avatar_bytes))
 
     def _apply_identity_result(
@@ -2440,8 +3222,10 @@ class AntiAfkApp:
                 }
 
         active_hwnds = {hwnd for hwnd, _, _, _ in self.window_map}
+        active_pids = {pid for _hwnd, _title, pid, _pname in self.window_map}
         self.instance_enabled_by_hwnd = {hwnd: enabled for hwnd, enabled in self.instance_enabled_by_hwnd.items() if hwnd in active_hwnds}
         self.instance_last_jump = {hwnd: ts for hwnd, ts in self.instance_last_jump.items() if hwnd in active_hwnds}
+        self.pid_log_hint = {pid: path for pid, path in self.pid_log_hint.items() if pid in active_pids}
 
         for hwnd, _title, pid, _pname in self.window_map:
             if hwnd not in self.instance_enabled_by_hwnd:
@@ -3967,6 +4751,7 @@ class AntiAfkApp:
             "--clean",
             "--onefile",
             "--windowed",
+            "--uac-admin",
             "--name",
             exe_name,
             "--icon",
