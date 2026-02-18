@@ -34,7 +34,7 @@ def _import_vgamepad_safely() -> tuple[Any | None, Exception | None]:
             # due to WMI probing; vgamepad calls platform.system() during import.
             try:
                 if getattr(platform, "_wmi", None) is not None:
-                    platform._wmi = None
+                    setattr(platform, "_wmi", None)
             except Exception:
                 pass
 
