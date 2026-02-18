@@ -31,7 +31,7 @@
   <img src="https://img.shields.io/badge/UI-Tkinter-4B8BBE?style=flat-square" alt="ui" />
 </p>
 
-![AFKScope UI](assets/afkscope-ui-v2.png)
+![AFKScope UI](assets/afkscope-ui-v3.png)
 
 <table>
   <tr>
