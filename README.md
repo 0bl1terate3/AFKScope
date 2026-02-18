@@ -33,7 +33,7 @@
   <img src="https://img.shields.io/badge/UI-Tkinter-4B8BBE?style=flat-square" alt="ui" />
 </p>
 
-![StayActive UI](assets/stayactive-ui-v0.1.png)
+![StayActive UI](stayactive-ui-v0.1.png)
 
 <table>
   <tr>
