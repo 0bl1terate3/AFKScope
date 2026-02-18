@@ -135,8 +135,7 @@ class AntiAfkApp:
         self.stats_var = tk.StringVar(value="Runtime 00:00:00 | Cycles 0 | Jumps 0 | Errors 0")
         self.auto_realign_var = tk.BooleanVar(value=False)
         self.jump_mode_var = tk.StringVar(value="all")
-        self.theme_mode_var = tk.StringVar(value="system")
-        self.dark_mode_var = tk.BooleanVar(value=False)
+        self.theme_name_var = tk.StringVar(value="Midnight")
 
         self.pause_enabled_var = tk.BooleanVar(value=False)
         self.pause_start_var = tk.StringVar(value="02:00")
@@ -179,30 +178,22 @@ class AntiAfkApp:
         self.tray_icon = None
         self.tray_enabled = False
 
-        self.theme_animating = False
-        self.theme_animation_after_id: str | None = None
-        self.system_theme_poll_after_id: str | None = None
-        self.current_theme_t = 0.0
-        self.palette_light = {
-            "bg": "#f2f2f2",
-            "panel": "#f8f8f8",
-            "field": "#ffffff",
-            "text": "#111111",
-            "muted": "#4d4d4d",
-            "accent": "#2f6feb",
-            "tree_sel": "#2f6feb",
-            "tree_selfg": "#ffffff",
+        self.current_theme_name = "Midnight"
+        self.theme_palettes: dict[str, dict[str, str]] = {
+            "Midnight": {"bg": "#171a1f", "panel": "#1f2430", "field": "#232a36", "text": "#e7ecf3", "muted": "#aeb8c8", "accent": "#7cb0ff", "tree_sel": "#355a93", "tree_selfg": "#ffffff"},
+            "Solarized Light": {"bg": "#fdf6e3", "panel": "#eee8d5", "field": "#fffdf7", "text": "#073642", "muted": "#586e75", "accent": "#268bd2", "tree_sel": "#268bd2", "tree_selfg": "#ffffff"},
+            "Neon Circuit": {"bg": "#0c1117", "panel": "#121926", "field": "#151f31", "text": "#d9fff3", "muted": "#86a5a0", "accent": "#00e6b8", "tree_sel": "#008a72", "tree_selfg": "#ffffff"},
+            "Rose Quartz": {"bg": "#fff0f6", "panel": "#ffe2ee", "field": "#fff8fb", "text": "#4d2a3a", "muted": "#8e6b7a", "accent": "#d9468f", "tree_sel": "#d9468f", "tree_selfg": "#ffffff"},
+            "Forest Mist": {"bg": "#eef5ef", "panel": "#dfece2", "field": "#f8fcf8", "text": "#1f3a2a", "muted": "#587260", "accent": "#2f855a", "tree_sel": "#2f855a", "tree_selfg": "#ffffff"},
+            "Crimson Night": {"bg": "#1a1114", "panel": "#27161c", "field": "#311c24", "text": "#ffe8ee", "muted": "#c7a9b3", "accent": "#ff4d6d", "tree_sel": "#9e2d44", "tree_selfg": "#ffffff"},
+            "Ocean Deep": {"bg": "#0c1c2b", "panel": "#12283d", "field": "#16324c", "text": "#e4f3ff", "muted": "#8db0c9", "accent": "#2ea3ff", "tree_sel": "#1f6dad", "tree_selfg": "#ffffff"},
+            "Amber Terminal": {"bg": "#16120a", "panel": "#241d10", "field": "#2d2414", "text": "#ffe8b8", "muted": "#b7a47d", "accent": "#ffb020", "tree_sel": "#9a6a00", "tree_selfg": "#ffffff"},
+            "Lavender Haze": {"bg": "#f6f3ff", "panel": "#ece7ff", "field": "#fbfaff", "text": "#362b57", "muted": "#6e6390", "accent": "#7c5cff", "tree_sel": "#7c5cff", "tree_selfg": "#ffffff"},
+            "Matrix": {"bg": "#0a100a", "panel": "#111a11", "field": "#142014", "text": "#b8ffb8", "muted": "#79a879", "accent": "#39ff14", "tree_sel": "#1f7d1f", "tree_selfg": "#ffffff"},
+            "Arctic Ice": {"bg": "#edf6fb", "panel": "#deedf6", "field": "#f7fcff", "text": "#173247", "muted": "#5c7a8f", "accent": "#1999d6", "tree_sel": "#1999d6", "tree_selfg": "#ffffff"},
+            "Obsidian Gold": {"bg": "#141414", "panel": "#1e1e1e", "field": "#252525", "text": "#f7f1df", "muted": "#b5aa89", "accent": "#d4a72c", "tree_sel": "#80641a", "tree_selfg": "#ffffff"},
         }
-        self.palette_dark = {
-            "bg": "#171a1f",
-            "panel": "#1f2430",
-            "field": "#232a36",
-            "text": "#e7ecf3",
-            "muted": "#aeb8c8",
-            "accent": "#7cb0ff",
-            "tree_sel": "#355a93",
-            "tree_selfg": "#ffffff",
-        }
+        self.current_palette = dict(self.theme_palettes[self.current_theme_name])
 
         self.username_patterns = [
             re.compile(r'displayName["\s:]+([A-Za-z0-9_]{3,20})'),
@@ -259,10 +250,10 @@ class AntiAfkApp:
                 r"\b(Sandstorm|Sand\s+Storm|Hell|Starfall|Heaven|Corruption|Null|Glitched|Dreamspace|Cyberspace|Windy|Snowy|Rainy|Pumpkin\s*Moon|Graveyard|Blood\s*Rain|Aurora)\b",
                 re.IGNORECASE,
             ),
-        ]
+        ] 
 
         self._build_ui()
-        self._apply_current_theme_mode(animated=False)
+        self._apply_selected_theme()
         self._render_biome_badge()
         os.makedirs(self.presets_dir, exist_ok=True)
         self._refresh_preset_list()
@@ -290,7 +281,6 @@ class AntiAfkApp:
             self.run_diagnostics_checks()
             self._schedule_stats_update()
             self._schedule_instance_poll()
-            self._schedule_system_theme_poll()
         except Exception as exc:
             self.log(f"Startup checks failed: {exc}")
 
@@ -308,13 +298,18 @@ class AntiAfkApp:
 
         header = ttk.Frame(container)
         header.pack(fill="x", pady=(0, 8))
-        self.theme_toggle_btn = ttk.Button(
-            header,
-            text="\u2600",
-            width=3,
-            command=self.toggle_theme_mode_button,
+        header_theme = ttk.Frame(header)
+        header_theme.pack(side=tk.RIGHT, anchor="ne")
+        ttk.Label(header_theme, text="Theme").pack(side=tk.LEFT, padx=(0, 6))
+        self.theme_combo = ttk.Combobox(
+            header_theme,
+            textvariable=self.theme_name_var,
+            values=sorted(self.theme_palettes.keys()),
+            width=18,
+            state="readonly",
         )
-        self.theme_toggle_btn.pack(side=tk.RIGHT, anchor="ne")
+        self.theme_combo.pack(side=tk.LEFT)
+        self.theme_combo.bind("<<ComboboxSelected>>", self.on_theme_selected)
         ttk.Label(header, text="AFKScope", font=("Segoe UI", 12, "bold")).pack(anchor="center")
         ttk.Label(
             header,
@@ -529,19 +524,17 @@ class AntiAfkApp:
     def _rgb_to_hex(rgb: tuple[int, int, int]) -> str:
         return f"#{rgb[0]:02x}{rgb[1]:02x}{rgb[2]:02x}"
 
-    def _mix(self, a: str, b: str, t: float) -> str:
-        ar, ag, ab = self._hex_to_rgb(a)
-        br, bg, bb = self._hex_to_rgb(b)
-        rr = int(ar + (br - ar) * t)
-        rg = int(ag + (bg - ag) * t)
-        rb = int(ab + (bb - ab) * t)
-        return self._rgb_to_hex((rr, rg, rb))
-
-    def _theme_at(self, t: float) -> dict[str, str]:
-        return {
-            key: self._mix(self.palette_light[key], self.palette_dark[key], t)
-            for key in self.palette_light
-        }
+    def _apply_selected_theme(self) -> None:
+        name = self.theme_name_var.get().strip()
+        palette = self.theme_palettes.get(name)
+        if palette is None:
+            name = "Midnight"
+            self.theme_name_var.set(name)
+            palette = self.theme_palettes[name]
+        self.current_theme_name = name
+        self.current_palette = dict(palette)
+        self._apply_theme(self.current_palette)
+        self.log(f"Theme applied: {name}")
 
     def _apply_theme(self, palette: dict[str, str]) -> None:
         try:
@@ -596,84 +589,8 @@ class AntiAfkApp:
             )
             self._render_biome_badge()
 
-    def _animate_theme_to(self, target_t: float, duration_ms: int = 280, steps: int = 14) -> None:
-        if self.theme_animation_after_id:
-            self.root.after_cancel(self.theme_animation_after_id)
-            self.theme_animation_after_id = None
-
-        start_t = self.current_theme_t
-        delta = target_t - start_t
-        if abs(delta) < 0.001:
-            self.current_theme_t = target_t
-            self._apply_theme(self._theme_at(self.current_theme_t))
-            return
-
-        self.theme_animating = True
-        step_delay = max(10, duration_ms // steps)
-
-        def _tick(i: int) -> None:
-            progress = i / steps
-            self.current_theme_t = start_t + delta * progress
-            self._apply_theme(self._theme_at(self.current_theme_t))
-            if i < steps:
-                self.theme_animation_after_id = self.root.after(step_delay, _tick, i + 1)
-            else:
-                self.theme_animating = False
-                self.theme_animation_after_id = None
-
-        _tick(0)
-
-    def _update_theme_toggle_icon(self) -> None:
-        if hasattr(self, "theme_toggle_btn"):
-            mode = self.theme_mode_var.get()
-            if mode == "dark":
-                self.theme_toggle_btn.configure(text="\u263e")
-            elif mode == "light":
-                self.theme_toggle_btn.configure(text="\u2600")
-            else:
-                self.theme_toggle_btn.configure(text="A")
-
-    def _detect_system_dark_mode(self) -> bool:
-        if os.name != "nt":
-            return False
-        try:
-            import winreg
-
-            key_path = r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize"
-            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, key_path) as key:
-                value, _ = winreg.QueryValueEx(key, "AppsUseLightTheme")
-            return int(value) == 0
-        except Exception:
-            return False
-
-    def _effective_dark_mode(self) -> bool:
-        mode = self.theme_mode_var.get()
-        if mode == "dark":
-            return True
-        if mode == "light":
-            return False
-        return self._detect_system_dark_mode()
-
-    def _apply_current_theme_mode(self, animated: bool = True) -> None:
-        is_dark = self._effective_dark_mode()
-        self.dark_mode_var.set(is_dark)
-        target = 1.0 if is_dark else 0.0
-        self._update_theme_toggle_icon()
-        if animated:
-            self._animate_theme_to(target)
-        else:
-            self.current_theme_t = target
-            self._apply_theme(self._theme_at(self.current_theme_t))
-
-    def toggle_theme_mode_button(self) -> None:
-        order = ("system", "light", "dark")
-        current = self.theme_mode_var.get()
-        try:
-            idx = order.index(current)
-        except ValueError:
-            idx = 0
-        self.theme_mode_var.set(order[(idx + 1) % len(order)])
-        self._apply_current_theme_mode(animated=True)
+    def on_theme_selected(self, _event: tk.Event | None = None) -> None:
+        self._apply_selected_theme()
 
     @staticmethod
     def _pick_text_color(bg_hex: str) -> str:
@@ -750,7 +667,7 @@ class AntiAfkApp:
             color = BIOME_COLOR_MAP[biome]
             text = biome
         else:
-            color = self._theme_at(self.current_theme_t)["field"]
+            color = self.current_palette["field"]
             text = "Unknown"
         if biome == "GLITCHED":
             text = "GL1TCHED" if int(time.time() * 2) % 2 else "GLITCHED"
@@ -1636,13 +1553,6 @@ class AntiAfkApp:
         self._poll_biome_tracker()
         self.root.after(2500, self._schedule_instance_poll)
 
-    def _schedule_system_theme_poll(self) -> None:
-        if self.theme_mode_var.get() == "system":
-            target = 1.0 if self._effective_dark_mode() else 0.0
-            if abs(target - self.current_theme_t) > 0.01:
-                self._apply_current_theme_mode(animated=True)
-        self.system_theme_poll_after_id = self.root.after(3000, self._schedule_system_theme_poll)
-
     def _enabled_by_pid_snapshot(self) -> dict[int, bool]:
         mapping: dict[int, bool] = {}
         for hwnd, _title, pid, _pname in self.window_map:
@@ -1662,8 +1572,7 @@ class AntiAfkApp:
             "webhook_url": self.webhook_url_var.get().strip(),
             "watchdog_enabled": bool(self.watchdog_enabled_var.get()),
             "watchdog_threshold": self.watchdog_threshold_var.get().strip(),
-            "theme_mode": self.theme_mode_var.get(),
-            "dark_mode": bool(self.dark_mode_var.get()),
+            "theme_name": self.theme_name_var.get().strip(),
             "biome_alerts_enabled": bool(self.biome_alerts_enabled_var.get()),
             "rare_biome": self.rare_biome_var.get().strip().upper(),
         }
@@ -1691,14 +1600,14 @@ class AntiAfkApp:
         self.webhook_url_var.set(str(data.get("webhook_url", "")))
         self.watchdog_enabled_var.set(bool(data.get("watchdog_enabled", True)))
         self.watchdog_threshold_var.set(str(data.get("watchdog_threshold", "12")))
-        theme_mode = str(data.get("theme_mode", "")).strip().lower()
-        if theme_mode not in {"light", "dark", "system"}:
-            theme_mode = "dark" if bool(data.get("dark_mode", False)) else "light"
-        self.theme_mode_var.set(theme_mode)
-        self.dark_mode_var.set(self._effective_dark_mode())
+        theme_name = str(data.get("theme_name", "")).strip()
+        if theme_name not in self.theme_palettes:
+            legacy_dark = bool(data.get("dark_mode", False))
+            theme_name = "Midnight" if legacy_dark else "Solarized Light"
+        self.theme_name_var.set(theme_name)
         self.biome_alerts_enabled_var.set(bool(data.get("biome_alerts_enabled", False)))
         self.rare_biome_var.set(str(data.get("rare_biome", "GLITCHED")).strip().upper() or "GLITCHED")
-        self._apply_current_theme_mode(animated=False)
+        self._apply_selected_theme()
         self.refresh_instance_list(manual=False)
 
     @staticmethod
@@ -1782,7 +1691,7 @@ class AntiAfkApp:
             f"Roblox windows detected: {len(windows)}",
             f"Biome log source: {latest_log}",
             f"Current biome: {self.current_biome_name} ({self.current_biome_source})",
-            f"Theme mode: {self.theme_mode_var.get()} ({'dark' if self.dark_mode_var.get() else 'light'})",
+            f"Theme: {self.current_theme_name}",
             f"Webhook configured: {'YES' if webhook_on else 'NO'}",
             f"Rare biome alerts: {'ON' if self.biome_alerts_enabled_var.get() else 'OFF'} ({self.rare_biome_var.get().strip().upper() or 'GLITCHED'})",
             f"Session errors: {self.session_errors}",
@@ -1974,12 +1883,6 @@ class AntiAfkApp:
     def on_close(self) -> None:
         self.stop()
         self.save_config()
-        if self.system_theme_poll_after_id:
-            self.root.after_cancel(self.system_theme_poll_after_id)
-            self.system_theme_poll_after_id = None
-        if self.theme_animation_after_id:
-            self.root.after_cancel(self.theme_animation_after_id)
-            self.theme_animation_after_id = None
         if self.tray_icon is not None:
             self.tray_icon.stop()
             self.tray_icon = None
