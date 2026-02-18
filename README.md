@@ -132,11 +132,10 @@ pip install pystray pillow
 
 ## Patch Notes (v0.1.4)
 
-- Made it so whenever you launch Roblox, StayActive automatically closes the singleton event, allowing you to run multiple Roblox instances at the same time natively.
-- Improved singleton-event cleanup reliability with global handle scanning, forced source-handle close behavior, and short retry passes.
-- Enables `SeDebugPrivilege` at startup so handle cleanup can run consistently.
-- Improved username/avatar identity mapping with stronger log extraction and tighter username/userId pairing.
-- Expanded runtime diagnostics for cleanup attempts (privilege state, scan counts, and retry outcomes).
+- You can now open multiple Roblox instances at the same time natively. StayActive closes the Roblox singleton lock automatically when Roblox starts.
+- Multi-instance startup is more reliable. If Roblox recreates the lock, StayActive retries quickly in the background.
+- Account detection is more accurate, so usernames and avatars are less likely to be mismatched between instances.
+- The app now gives clearer startup and cleanup logs, making it easier to see what happened if something fails.
 
 ## Previous Notes
 
