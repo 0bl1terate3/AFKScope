@@ -19,6 +19,8 @@
 <p align="center">
   <a href="https://github.com/0bl1terate3/AFKScope/releases/latest"><b>Download Latest EXE</b></a>
   |
+  <a href="https://discord.gg/MSVrKb5B9N"><b>Support Discord</b></a>
+  |
   <a href="#quick-start"><b>Quick Start</b></a>
   |
   <a href="#build-exe"><b>Build From Source</b></a>
@@ -125,6 +127,7 @@ pip install pystray pillow
 - Added custom theme persistence in `afkscope_themes.json`.
 - Added dedicated header logo asset for improved header clarity.
 - Included custom themes in portable export/import and debug bundle exports.
+- Added official support Discord link: `https://discord.gg/MSVrKb5B9N`.
 - Added AFKScope wiki-ready page content (`afkscopepage.md`) and macro list update (`macros.md`).
 
 ## Build EXE
