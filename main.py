@@ -2,6 +2,7 @@
 import csv
 import ctypes
 import json
+import hashlib
 import math
 import os
 import queue
@@ -11,6 +12,7 @@ import subprocess
 import sys
 import threading
 import time
+import traceback
 import tkinter as tk
 import webbrowser
 import zipfile
@@ -101,7 +103,7 @@ BIOME_ALIAS_MAP: dict[str, str] = {
     "aurora": "AURORA",
 }
 
-APP_VERSION = "0.1.1"
+APP_VERSION = "0.1.2"
 APP_NAME = "StayActive"
 APP_USER_AGENT = f"{APP_NAME}/{APP_VERSION}"
 APP_ICON_ICO = "STAYACTIVE ICON.ico"
@@ -180,6 +182,13 @@ class AntiAfkApp:
         self.startup_auto_start_var = tk.BooleanVar(value=False)
         self.startup_auto_align_var = tk.BooleanVar(value=False)
         self.event_filter_var = tk.StringVar(value="all")
+        self.scheduler_enabled_var = tk.BooleanVar(value=False)
+        self.scheduler_slot1_time_var = tk.StringVar(value="08:00")
+        self.scheduler_slot1_preset_var = tk.StringVar(value="day")
+        self.scheduler_slot2_time_var = tk.StringVar(value="23:30")
+        self.scheduler_slot2_preset_var = tk.StringVar(value="overnight")
+        self.update_banner_var = tk.StringVar(value="Checking for updates...")
+        self.latest_release_tag_var = tk.StringVar(value="Latest: -")
 
         self.pause_enabled_var = tk.BooleanVar(value=False)
         self.pause_start_var = tk.StringVar(value="02:00")
@@ -207,12 +216,14 @@ class AntiAfkApp:
         self.instance_last_jump: dict[int, float] = {}
         self.instance_interval_override: dict[int, float] = {}
         self.instance_pattern_override: dict[int, str] = {}
+        self.instance_priority_by_pid: dict[int, int] = {}
         self.instance_fail_count: dict[int, int] = {}
         self.instance_attempt_count: dict[int, int] = {}
         self.instance_quarantine_until: dict[int, float] = {}
         self.instance_quarantine_fail_threshold = 6
         self.instance_quarantine_seconds = 180
         self.enabled_by_username: dict[str, bool] = {}
+        self.override_by_username: dict[str, dict[str, Any]] = {}
 
         self.pid_username: dict[int, str] = {}
         self.pid_user_id: dict[int, int] = {}
@@ -240,6 +251,11 @@ class AntiAfkApp:
         self.waiting_for_windows = False
         self.pause_override_until: float | None = None
         self.last_not_due_log_at = 0.0
+        self.scheduler_last_applied_key: str | None = None
+        self.latest_release_asset_url = ""
+        self.latest_release_asset_name = ""
+        self.reports_dir = os.path.join(os.getcwd(), "reports")
+        self.hotkey_help_window: tk.Toplevel | None = None
 
         self.tray_icon = None
         self.tray_enabled = False
@@ -273,6 +289,7 @@ class AntiAfkApp:
         self.current_palette = dict(self.theme_palettes[self.current_theme_name])
         self.instance_override_seconds_var: tk.StringVar | None = None
         self.instance_override_pattern_var: tk.StringVar | None = None
+        self.instance_priority_var: tk.StringVar | None = None
 
         self.username_patterns = [
             re.compile(r'displayName["\s:]+([A-Za-z0-9_]{3,20})'),
@@ -337,9 +354,11 @@ class AntiAfkApp:
         self._apply_selected_theme()
         self._render_biome_badge()
         os.makedirs(self.presets_dir, exist_ok=True)
+        os.makedirs(self.reports_dir, exist_ok=True)
         self._refresh_preset_list()
         self.load_config(silent=True)
         self._write_recovery_state_marker()
+        self._install_exception_hooks()
         self._ensure_window_visible()
         self.root.after(50, self._finish_startup)
 
@@ -366,6 +385,7 @@ class AntiAfkApp:
             self._schedule_instance_poll()
             self._schedule_recovery_autosave()
             self._apply_startup_restore()
+            self.root.after(2200, self._start_background_update_check)
             if self.recovery_prompt_needed:
                 self.log("Detected previous unclean shutdown state.")
                 self.root.after(250, self._prompt_recovery_restore)
@@ -487,6 +507,13 @@ class AntiAfkApp:
             font=("Segoe UI", 9, "normal"),
         )
         self.header_subtitle_label.pack(anchor="center", pady=(2, 0))
+        update_banner = ttk.Frame(header)
+        update_banner.pack(fill="x", pady=(4, 0))
+        ttk.Label(update_banner, textvariable=self.update_banner_var).pack(side=tk.LEFT)
+        ttk.Label(update_banner, textvariable=self.latest_release_tag_var).pack(side=tk.LEFT, padx=(10, 0))
+        ttk.Button(update_banner, text="Download Latest", width=14, command=self.download_latest_release_asset).pack(
+            side=tk.RIGHT
+        )
 
         notebook = ttk.Notebook(container)
         notebook.pack(fill="both", expand=True)
@@ -495,10 +522,25 @@ class AntiAfkApp:
         tab_instances = ttk.Frame(notebook, padding=10)
         tab_monitor = ttk.Frame(notebook, padding=10)
         tab_log = ttk.Frame(notebook, padding=10)
-        notebook.add(tab_control, text="Controls")
+        notebook.add(tab_control, text="Dashboard")
         notebook.add(tab_instances, text="Instances")
-        notebook.add(tab_monitor, text="Monitor")
-        notebook.add(tab_log, text="Log")
+        notebook.add(tab_monitor, text="Health & Diagnostics")
+        notebook.add(tab_log, text="Live Log")
+
+        quick_access = ttk.LabelFrame(tab_control, text="Quick Start", padding=10)
+        quick_access.pack(fill="x", pady=(0, 8))
+        ttk.Label(
+            quick_access,
+            text="1) Refresh instances  2) Enable/disable rows in Instances tab  3) Press Start  4) Use Hotkey Help for shortcuts",
+        ).pack(anchor="w")
+        qa_actions = ttk.Frame(quick_access)
+        qa_actions.pack(fill="x", pady=(6, 0))
+        ttk.Button(qa_actions, text="Refresh Instances", width=16, command=lambda: self.refresh_instance_list(manual=True)).pack(
+            side=tk.LEFT
+        )
+        ttk.Button(qa_actions, text="Run Diagnostics", width=14, command=self.run_diagnostics_checks).pack(side=tk.LEFT, padx=(6, 0))
+        ttk.Button(qa_actions, text="Hotkey Help", width=12, command=self.toggle_hotkey_help).pack(side=tk.LEFT, padx=(6, 0))
+        ttk.Button(qa_actions, text="Check Updates", width=12, command=self.check_for_updates).pack(side=tk.LEFT, padx=(6, 0))
 
         controls_group = ttk.LabelFrame(tab_control, text="Main Controls", padding=10)
         controls_group.pack(fill="x")
@@ -511,6 +553,7 @@ class AntiAfkApp:
         ttk.Label(row1, text="Jump mode:").pack(side=tk.LEFT)
         ttk.Radiobutton(row1, text="All-at-once", variable=self.jump_mode_var, value="all").pack(side=tk.LEFT, padx=(6, 4))
         ttk.Radiobutton(row1, text="Round-robin", variable=self.jump_mode_var, value="round").pack(side=tk.LEFT)
+        ttk.Radiobutton(row1, text="Weighted", variable=self.jump_mode_var, value="weighted").pack(side=tk.LEFT, padx=(8, 0))
 
         row2 = ttk.Frame(controls_group)
         row2.pack(fill="x", pady=(8, 0))
@@ -565,6 +608,7 @@ class AntiAfkApp:
         opt2.pack(fill="x", pady=(6, 0))
         ttk.Checkbutton(opt2, text="Discord webhook alerts", variable=self.webhook_enabled_var).pack(side=tk.LEFT)
         ttk.Entry(opt2, textvariable=self.webhook_url_var, width=70).pack(side=tk.LEFT, padx=(8, 0))
+        ttk.Button(opt2, text="Test Webhook", width=12, command=self.test_webhook_health).pack(side=tk.LEFT, padx=(8, 0))
 
         opt3 = ttk.Frame(options_group)
         opt3.pack(fill="x", pady=(6, 0))
@@ -700,6 +744,16 @@ class AntiAfkApp:
         self.profile_hotkey_3_entry = ttk.Entry(quick_profiles_row, textvariable=self.profile_hotkey_3_var, width=12)
         self.profile_hotkey_3_entry.pack(side=tk.LEFT, padx=4)
 
+        scheduler_row = ttk.Frame(options_group)
+        scheduler_row.pack(fill="x", pady=(6, 0))
+        ttk.Checkbutton(scheduler_row, text="Profile scheduler", variable=self.scheduler_enabled_var).pack(side=tk.LEFT)
+        ttk.Label(scheduler_row, text="Slot 1").pack(side=tk.LEFT, padx=(10, 3))
+        ttk.Entry(scheduler_row, textvariable=self.scheduler_slot1_time_var, width=6, justify="center").pack(side=tk.LEFT)
+        ttk.Entry(scheduler_row, textvariable=self.scheduler_slot1_preset_var, width=12).pack(side=tk.LEFT, padx=(4, 8))
+        ttk.Label(scheduler_row, text="Slot 2").pack(side=tk.LEFT, padx=(6, 3))
+        ttk.Entry(scheduler_row, textvariable=self.scheduler_slot2_time_var, width=6, justify="center").pack(side=tk.LEFT)
+        ttk.Entry(scheduler_row, textvariable=self.scheduler_slot2_preset_var, width=12).pack(side=tk.LEFT, padx=(4, 0))
+
         history_group = ttk.LabelFrame(tab_monitor, text="Biome Alert History", padding=8)
         history_group.pack(fill="x", pady=(8, 0))
         self.biome_history_list = tk.Listbox(history_group, height=4)
@@ -713,7 +767,7 @@ class AntiAfkApp:
         self.event_filter_combo = ttk.Combobox(
             timeline_actions,
             textvariable=self.event_filter_var,
-            values=["all", "errors", "watchdog", "biome", "hotkeys", "health", "recovery"],
+            values=["all", "errors", "watchdog", "biome", "hotkeys", "health", "recovery", "scheduler", "updates"],
             width=12,
             state="readonly",
         )
@@ -748,6 +802,11 @@ class AntiAfkApp:
             width=11,
             state="readonly",
         ).pack(side=tk.LEFT, padx=(6, 8))
+        ttk.Label(target_overrides, text="Priority (1-9):").pack(side=tk.LEFT)
+        self.instance_priority_var = tk.StringVar(value="1")
+        ttk.Entry(target_overrides, textvariable=self.instance_priority_var, width=4, justify="center").pack(
+            side=tk.LEFT, padx=(6, 8)
+        )
         ttk.Button(target_overrides, text="Apply to Selected", command=self.apply_selected_instance_overrides).pack(
             side=tk.LEFT, padx=(0, 6)
         )
@@ -756,10 +815,11 @@ class AntiAfkApp:
         tree_frame = ttk.Frame(target_group)
         tree_frame.pack(fill="both", expand=True, pady=(8, 0))
 
-        columns = ("enabled", "pid", "hwnd", "process", "username", "confidence", "last_jump", "title")
+        columns = ("enabled", "priority", "pid", "hwnd", "process", "username", "confidence", "last_jump", "title")
         self.instance_tree = ttk.Treeview(tree_frame, columns=columns, show="tree headings", height=8)
         self.instance_tree.heading("#0", text="Avatar")
         self.instance_tree.heading("enabled", text="Enabled")
+        self.instance_tree.heading("priority", text="Prio")
         self.instance_tree.heading("pid", text="PID")
         self.instance_tree.heading("hwnd", text="HWND")
         self.instance_tree.heading("process", text="Process")
@@ -769,6 +829,7 @@ class AntiAfkApp:
         self.instance_tree.heading("title", text="Window Title")
         self.instance_tree.column("#0", width=56, anchor="center", stretch=False)
         self.instance_tree.column("enabled", width=70, anchor="center")
+        self.instance_tree.column("priority", width=52, anchor="center")
         self.instance_tree.column("pid", width=70, anchor="center")
         self.instance_tree.column("hwnd", width=95, anchor="center")
         self.instance_tree.column("process", width=150, anchor="w")
@@ -799,7 +860,9 @@ class AntiAfkApp:
         ttk.Button(diag_row, text="Run Checks", width=12, command=self.run_diagnostics_checks).pack(side=tk.LEFT, padx=(0, 5))
         ttk.Button(diag_row, text="Export Debug Bundle", width=18, command=self.export_debug_bundle).pack(side=tk.LEFT)
         ttk.Button(diag_row, text="Check Updates", width=13, command=self.check_for_updates).pack(side=tk.LEFT, padx=(5, 5))
+        ttk.Button(diag_row, text="Download Latest", width=14, command=self.download_latest_release_asset).pack(side=tk.LEFT, padx=(0, 5))
         ttk.Button(diag_row, text="Open Release", width=12, command=self.open_latest_release_page).pack(side=tk.LEFT, padx=(0, 5))
+        ttk.Button(diag_row, text="Hotkey Help", width=12, command=self.toggle_hotkey_help).pack(side=tk.LEFT, padx=(0, 5))
         ttk.Button(diag_row, text="Copy Diag", width=10, command=self.copy_diagnostics_to_clipboard).pack(side=tk.LEFT, padx=(0, 5))
         ttk.Button(diag_row, text="Copy Support", width=12, command=self.copy_support_bundle_to_clipboard).pack(side=tk.LEFT, padx=(0, 5))
         ttk.Button(diag_row, text="Export Portable", width=14, command=self.export_portable_bundle).pack(side=tk.LEFT, padx=(0, 5))
@@ -832,6 +895,77 @@ class AntiAfkApp:
             self._append_log_line(line)
         else:
             self.root.after(0, self._append_log_line, line)
+
+    def _install_exception_hooks(self) -> None:
+        previous_thread_hook = getattr(threading, "excepthook", None)
+
+        def _thread_hook(args: Any) -> None:
+            try:
+                details = "".join(traceback.format_exception(args.exc_type, args.exc_value, args.exc_traceback))
+                self._write_crash_report("thread-exception", details)
+            except Exception:
+                pass
+            if callable(previous_thread_hook):
+                try:
+                    previous_thread_hook(args)
+                except Exception:
+                    pass
+
+        if previous_thread_hook is not None:
+            threading.excepthook = _thread_hook  # type: ignore[assignment]
+
+    def _write_crash_report(self, reason: str, details: str) -> str | None:
+        try:
+            os.makedirs(self.reports_dir, exist_ok=True)
+            stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+            path = os.path.join(self.reports_dir, f"crash-{stamp}.txt")
+            lines = [
+                f"{APP_NAME} v{APP_VERSION}",
+                f"Reason: {reason}",
+                f"Time: {datetime.now().isoformat(timespec='seconds')}",
+                "",
+                "Exception:",
+                details.strip(),
+                "",
+                "Recent events:",
+                *self.event_timeline[-200:],
+                "",
+                "Recent app log tail:",
+                *self.log_box.get("1.0", tk.END).splitlines()[-200:],
+            ]
+            with open(path, "w", encoding="utf-8") as handle:
+                handle.write("\n".join(lines) + "\n")
+            return path
+        except Exception:
+            return None
+
+    def _write_session_report(self, reason: str) -> str | None:
+        try:
+            os.makedirs(self.reports_dir, exist_ok=True)
+            stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+            path = os.path.join(self.reports_dir, f"session-{stamp}-{reason}.json")
+            runtime_seconds = 0
+            if self.session_started_at is not None:
+                runtime_seconds = int(max(0, time.time() - self.session_started_at))
+            payload = {
+                "app": APP_NAME,
+                "version": APP_VERSION,
+                "reason": reason,
+                "time": datetime.now().isoformat(timespec="seconds"),
+                "runtime_seconds": runtime_seconds,
+                "session_cycles": self.session_cycles,
+                "session_jumps": self.session_jumps,
+                "session_errors": self.session_errors,
+                "watchdog_no_windows_cycles": self.no_window_cycles,
+                "watchdog_jump_fail_cycles": self.jump_fail_cycles,
+                "current_biome": self.current_biome_name,
+                "events_tail": self.event_timeline[-120:],
+            }
+            with open(path, "w", encoding="utf-8") as handle:
+                json.dump(payload, handle, indent=2)
+            return path
+        except Exception:
+            return None
 
     @staticmethod
     def _hex_to_rgb(value: str) -> tuple[int, int, int]:
@@ -1423,6 +1557,10 @@ class AntiAfkApp:
             return "health" in hay
         if mode == "recovery":
             return "recovery" in hay
+        if mode == "scheduler":
+            return "scheduler" in hay
+        if mode == "updates":
+            return "update" in hay
         return True
 
     def _refresh_event_history_view(self) -> None:
@@ -1698,6 +1836,8 @@ class AntiAfkApp:
             self.parse_autosave_minutes()
         self.parse_manual_pause_minutes()
         self._validate_pause_schedule()
+        if self.scheduler_enabled_var.get():
+            self._scheduler_slots()
         if self.webhook_enabled_var.get():
             url = self.webhook_url_var.get().strip()
             if not url:
@@ -1832,7 +1972,7 @@ class AntiAfkApp:
         ttk.Label(grid, text="Jump interval (seconds):").grid(row=0, column=0, sticky="w")
         ttk.Entry(grid, textvariable=interval_var, width=8, justify="center").grid(row=0, column=1, sticky="w", padx=(6, 0))
         ttk.Label(grid, text="Jump mode:").grid(row=1, column=0, sticky="w", pady=(8, 0))
-        ttk.Combobox(grid, textvariable=jump_mode_var, values=["all", "round"], state="readonly", width=10).grid(
+        ttk.Combobox(grid, textvariable=jump_mode_var, values=["all", "round", "weighted"], state="readonly", width=10).grid(
             row=1,
             column=1,
             sticky="w",
@@ -1925,6 +2065,41 @@ class AntiAfkApp:
             preset = self.profile_hotkey_3_var.get().strip() or "default"
         self.preset_name_var.set(self._sanitize_preset_name(preset))
         self.load_preset()
+
+    def toggle_hotkey_help(self) -> None:
+        if self.hotkey_help_window is not None and self.hotkey_help_window.winfo_exists():
+            self.hotkey_help_window.destroy()
+            self.hotkey_help_window = None
+            return
+        window = tk.Toplevel(self.root)
+        self.hotkey_help_window = window
+        window.title("Hotkey Help")
+        window.geometry("360x250")
+        window.resizable(False, False)
+        window.transient(self.root)
+        container = ttk.Frame(window, padding=10)
+        container.pack(fill="both", expand=True)
+        ttk.Label(container, text=f"{APP_NAME} Global Hotkeys", font=("Segoe UI", 10, "bold")).pack(anchor="w")
+        rows = [
+            ("Ctrl+Alt+S", "Start / Stop"),
+            ("Ctrl+Alt+J", "Jump Now"),
+            ("Ctrl+Alt+R", "Refresh Instances"),
+            ("Ctrl+Alt+T", "Minimize To Tray"),
+            ("Ctrl+Alt+1", f"Load preset: {self.profile_hotkey_1_var.get().strip() or 'default'}"),
+            ("Ctrl+Alt+2", f"Load preset: {self.profile_hotkey_2_var.get().strip() or 'default'}"),
+            ("Ctrl+Alt+3", f"Load preset: {self.profile_hotkey_3_var.get().strip() or 'default'}"),
+        ]
+        for key, desc in rows:
+            line = ttk.Frame(container)
+            line.pack(fill="x", pady=2)
+            ttk.Label(line, text=key, width=14).pack(side=tk.LEFT)
+            ttk.Label(line, text=desc).pack(side=tk.LEFT)
+        ttk.Label(
+            container,
+            text="Tip: if a hotkey does not register, another app may already own it.",
+            wraplength=330,
+        ).pack(anchor="w", pady=(10, 0))
+        ttk.Button(container, text="Close", command=self.toggle_hotkey_help).pack(anchor="e", pady=(10, 0))
 
     def _unregister_global_hotkeys(self) -> None:
         for hotkey_id in list(self.hotkey_actions.keys()):
@@ -2202,6 +2377,17 @@ class AntiAfkApp:
         if username:
             self.pid_username[pid] = username
             self.enabled_by_username.setdefault(username.lower(), True)
+            cached = self.override_by_username.get(username.lower())
+            if isinstance(cached, dict):
+                cached_interval = cached.get("interval")
+                if isinstance(cached_interval, (float, int)) and cached_interval > 0:
+                    self.instance_interval_override[pid] = float(cached_interval)
+                cached_pattern = cached.get("pattern")
+                if isinstance(cached_pattern, str) and cached_pattern in {"balanced", "subtle", "aggressive", "randomized"}:
+                    self.instance_pattern_override[pid] = cached_pattern
+                cached_priority = cached.get("priority")
+                if isinstance(cached_priority, int) and 1 <= cached_priority <= 9:
+                    self.instance_priority_by_pid[pid] = cached_priority
         self.pid_identity_confidence[pid] = confidence
         if user_id is not None:
             self.pid_user_id[pid] = user_id
@@ -2225,7 +2411,13 @@ class AntiAfkApp:
         for old_hwnd, (_title, old_pid, _pname) in old_map.items():
             username = self.pid_username.get(old_pid)
             if username:
-                self.enabled_by_username[username.lower()] = self.instance_enabled_by_hwnd.get(old_hwnd, True)
+                uname = username.lower()
+                self.enabled_by_username[uname] = self.instance_enabled_by_hwnd.get(old_hwnd, True)
+                self.override_by_username[uname] = {
+                    "interval": self.instance_interval_override.get(old_pid),
+                    "pattern": self.instance_pattern_override.get(old_pid),
+                    "priority": self.instance_priority_by_pid.get(old_pid, 1),
+                }
 
         active_hwnds = {hwnd for hwnd, _, _, _ in self.window_map}
         self.instance_enabled_by_hwnd = {hwnd: enabled for hwnd, enabled in self.instance_enabled_by_hwnd.items() if hwnd in active_hwnds}
@@ -2238,6 +2430,18 @@ class AntiAfkApp:
                     self.instance_enabled_by_hwnd[hwnd] = self.enabled_by_username[username]
                 else:
                     self.instance_enabled_by_hwnd[hwnd] = self.loaded_enabled_by_pid.get(pid, True)
+            username = self.pid_username.get(pid, "").lower()
+            if username and username in self.override_by_username:
+                cached = self.override_by_username[username]
+                cached_interval = cached.get("interval")
+                if isinstance(cached_interval, (float, int)) and cached_interval > 0:
+                    self.instance_interval_override[pid] = float(cached_interval)
+                cached_pattern = cached.get("pattern")
+                if isinstance(cached_pattern, str) and cached_pattern in {"balanced", "subtle", "aggressive", "randomized"}:
+                    self.instance_pattern_override[pid] = cached_pattern
+                cached_priority = cached.get("priority")
+                if isinstance(cached_priority, int) and 1 <= cached_priority <= 9:
+                    self.instance_priority_by_pid[pid] = cached_priority
 
         for item in self.instance_tree.get_children():
             self.instance_tree.delete(item)
@@ -2248,11 +2452,13 @@ class AntiAfkApp:
             if not username:
                 username = "Detecting..." if pid in self.identity_lookup_inflight else "Unknown"
             confidence = self.pid_identity_confidence.get(pid, "unknown")
+            priority = self.instance_priority_by_pid.get(pid, 1)
             last_jump = self.instance_last_jump.get(hwnd)
             last_jump_str = time.strftime("%H:%M:%S", time.localtime(last_jump)) if last_jump else "-"
             avatar = self.pid_avatar_photo.get(pid)
             values = (
                 "Yes" if enabled else "No",
+                str(priority),
                 str(pid),
                 str(hwnd),
                 pname or "unknown.exe",
@@ -2310,12 +2516,13 @@ class AntiAfkApp:
                     age_str = f"{age}s"
                 attempts = self.instance_attempt_count.get(hwnd, 0)
                 fails = self.instance_fail_count.get(hwnd, 0)
+                priority = self.instance_priority_by_pid.get(pid, 1)
                 reliability = "n/a" if attempts == 0 else f"{max(0.0, (attempts - fails) * 100 / attempts):.0f}%"
                 quarantine_left = max(0, int(self.instance_quarantine_until.get(hwnd, 0.0) - time.time()))
                 quarantine_text = f" | quarantine {quarantine_left}s" if quarantine_left > 0 else ""
                 status = "ENABLED" if enabled else "DISABLED"
                 lines.append(
-                    f"PID {pid} | {username} ({confidence}) | HWND {hwnd} | {status} | last jump {last_jump_str} ({age_str}) | reliability {reliability}{quarantine_text} | {title[:22]}"
+                    f"PID {pid} | prio {priority} | {username} ({confidence}) | HWND {hwnd} | {status} | last jump {last_jump_str} ({age_str}) | reliability {reliability}{quarantine_text} | {title[:20]}"
                 )
             lines.insert(1, f"Enabled {enabled_count}/{len(self.window_map)} instances")
 
@@ -2392,7 +2599,9 @@ class AntiAfkApp:
             return
         raw_interval = self.instance_override_seconds_var.get().strip() if self.instance_override_seconds_var is not None else ""
         raw_pattern = self.instance_override_pattern_var.get().strip().lower() if self.instance_override_pattern_var is not None else "default"
+        raw_priority = self.instance_priority_var.get().strip() if self.instance_priority_var is not None else "1"
         interval_override: float | None = None
+        priority_value = 1
         if raw_interval:
             try:
                 interval_override = float(raw_interval)
@@ -2402,6 +2611,11 @@ class AntiAfkApp:
             if interval_override <= 0:
                 messagebox.showerror("Instance Override", "Interval override must be > 0.")
                 return
+        try:
+            priority_value = self._parse_priority(raw_priority)
+        except Exception as exc:
+            messagebox.showerror("Instance Override", str(exc))
+            return
         if raw_pattern not in {"default", "balanced", "subtle", "aggressive", "randomized"}:
             messagebox.showerror("Instance Override", "Invalid override pattern.")
             return
@@ -2422,6 +2636,7 @@ class AntiAfkApp:
                 self.instance_pattern_override.pop(pid, None)
             else:
                 self.instance_pattern_override[pid] = raw_pattern
+            self.instance_priority_by_pid[pid] = priority_value
             applied += 1
         if applied > 0:
             self.log(f"Applied per-instance overrides to {applied} instance(s).")
@@ -2443,6 +2658,7 @@ class AntiAfkApp:
                 continue
             self.instance_interval_override.pop(pid, None)
             self.instance_pattern_override.pop(pid, None)
+            self.instance_priority_by_pid.pop(pid, None)
             cleared += 1
         if cleared > 0:
             self.log(f"Cleared per-instance overrides for {cleared} instance(s).")
@@ -2611,6 +2827,51 @@ class AntiAfkApp:
             raise ValueError("Quick pause minutes must be >= 1.")
         return value
 
+    @staticmethod
+    def _parse_priority(raw: str) -> int:
+        try:
+            value = int(raw.strip())
+        except ValueError as exc:
+            raise ValueError("Priority must be an integer.") from exc
+        if value < 1 or value > 9:
+            raise ValueError("Priority must be between 1 and 9.")
+        return value
+
+    def _scheduler_slots(self) -> list[tuple[int, str]]:
+        slots: list[tuple[int, str]] = []
+        for time_var, preset_var in (
+            (self.scheduler_slot1_time_var, self.scheduler_slot1_preset_var),
+            (self.scheduler_slot2_time_var, self.scheduler_slot2_preset_var),
+        ):
+            preset = self._sanitize_preset_name(preset_var.get().strip() or "default")
+            hour, minute = self._parse_hhmm(time_var.get(), "Scheduler time")
+            slots.append((hour * 60 + minute, preset))
+        return slots
+
+    def _dangerous_setting_warnings(self) -> list[str]:
+        warnings: list[str] = []
+        try:
+            interval = self.parse_interval()
+            if interval < 2:
+                warnings.append("Jump interval under 2 seconds may be unstable.")
+        except Exception:
+            pass
+        try:
+            jump_fail_threshold = self.parse_jump_fail_watchdog_threshold()
+            if jump_fail_threshold < 3:
+                warnings.append("Jump-fail watchdog under 3 cycles can cause frequent resets.")
+        except Exception:
+            pass
+        try:
+            no_windows_threshold = self.parse_no_windows_watchdog_threshold()
+            if no_windows_threshold < 5:
+                warnings.append("No-windows watchdog under 5 cycles may spam refresh/recovery.")
+        except Exception:
+            pass
+        if self.webhook_enabled_var.get() and not self.webhook_url_var.get().strip():
+            warnings.append("Webhook is enabled but URL is empty.")
+        return warnings
+
     def pause_for_minutes(self) -> None:
         try:
             minutes = self.parse_manual_pause_minutes()
@@ -2670,6 +2931,7 @@ class AntiAfkApp:
         windows = self.find_roblox_windows()
         now = time.time()
         enabled: list[int] = []
+        priority_by_hwnd: dict[int, int] = {}
         for hwnd, _title, pid, _pname in windows:
             if not self.instance_enabled_by_hwnd.get(hwnd, True):
                 continue
@@ -2681,6 +2943,7 @@ class AntiAfkApp:
             if last_jump and (now - last_jump) < interval:
                 continue
             enabled.append(hwnd)
+            priority_by_hwnd[hwnd] = self.instance_priority_by_pid.get(pid, 1)
         if not enabled:
             return []
 
@@ -2689,6 +2952,17 @@ class AntiAfkApp:
             hwnd = enabled[self.round_robin_index]
             self.round_robin_index = (self.round_robin_index + 1) % len(enabled)
             return [hwnd]
+        if self.jump_mode_var.get() == "weighted":
+            wheel: list[int] = []
+            for hwnd in enabled:
+                weight = max(1, min(9, priority_by_hwnd.get(hwnd, 1)))
+                wheel.extend([hwnd] * weight)
+            if not wheel:
+                return []
+            self.round_robin_index = self.round_robin_index % len(wheel)
+            chosen = wheel[self.round_robin_index]
+            self.round_robin_index = (self.round_robin_index + 1) % len(wheel)
+            return [chosen]
         return enabled
 
     def _reset_gamepad_session(self) -> None:
@@ -2838,6 +3112,10 @@ class AntiAfkApp:
                 with self.metrics_lock:
                     self.session_errors += 1
                 self.log(f"Error while sending jump: {exc}")
+                details = traceback.format_exc()
+                crash_path = self._write_crash_report("worker-loop", details)
+                if crash_path:
+                    self.log(f"Crash report saved: {crash_path}")
                 self._record_event(f"Loop error: {exc}")
                 self._send_webhook(f"{APP_NAME} Error", f"Jump loop error: {exc}")
                 self.root.after(0, self.stop)
@@ -2864,6 +3142,12 @@ class AntiAfkApp:
                 self.session_errors += 1
             messagebox.showerror("Cannot start", str(exc))
             return
+        warnings = self._dangerous_setting_warnings()
+        if warnings:
+            message = "Potentially risky settings detected:\n\n- " + "\n- ".join(warnings) + "\n\nStart anyway?"
+            if not messagebox.askyesno("Safety guardrails", message):
+                self.log("Start canceled by user after safety warning.")
+                return
 
         with self.metrics_lock:
             if self.session_started_at is None:
@@ -2877,6 +3161,7 @@ class AntiAfkApp:
         self.worker_thread.start()
         self.set_running_ui(True)
         self._write_recovery_snapshot(force=True)
+        self._write_session_report("start")
 
     def stop(self) -> None:
         self.stop_event.set()
@@ -2885,6 +3170,7 @@ class AntiAfkApp:
         self.waiting_for_windows = False
         self.set_running_ui(False)
         self._write_recovery_snapshot(force=True)
+        self._write_session_report("stop")
 
     def _schedule_stats_update(self) -> None:
         with self.metrics_lock:
@@ -2905,8 +3191,42 @@ class AntiAfkApp:
     def _schedule_instance_poll(self) -> None:
         self.refresh_instance_list(manual=False)
         self._poll_biome_tracker()
+        self._check_profile_scheduler()
         self._check_instance_health_alerts()
         self.root.after(2500, self._schedule_instance_poll)
+
+    def _check_profile_scheduler(self) -> None:
+        if not self.scheduler_enabled_var.get():
+            self.scheduler_last_applied_key = None
+            return
+        try:
+            slots = self._scheduler_slots()
+        except Exception:
+            return
+        if not slots:
+            return
+        now = datetime.now()
+        now_min = now.hour * 60 + now.minute
+        slots = sorted(slots, key=lambda item: item[0])
+        selected = slots[-1]
+        for entry in slots:
+            if now_min >= entry[0]:
+                selected = entry
+            else:
+                break
+        key = f"{now.strftime('%Y%m%d-%H%M')}-{selected[1]}"
+        if self.scheduler_last_applied_key == key:
+            return
+        self.scheduler_last_applied_key = key
+        preset_name = selected[1]
+        path = self._preset_path(preset_name)
+        if not os.path.exists(path):
+            self.log(f"Scheduler skipped missing preset: {preset_name}")
+            return
+        self.preset_name_var.set(preset_name)
+        self.load_preset()
+        self.log(f"Scheduler applied preset: {preset_name}")
+        self._record_event(f"Scheduler preset: {preset_name}")
 
     def _check_instance_health_alerts(self) -> None:
         active_hwnds = {hwnd for hwnd, _title, _pid, _pname in self.window_map}
@@ -2987,6 +3307,11 @@ class AntiAfkApp:
             "startup_preset": self.startup_preset_var.get().strip(),
             "startup_auto_start": bool(self.startup_auto_start_var.get()),
             "startup_auto_align": bool(self.startup_auto_align_var.get()),
+            "scheduler_enabled": bool(self.scheduler_enabled_var.get()),
+            "scheduler_slot1_time": self.scheduler_slot1_time_var.get().strip(),
+            "scheduler_slot1_preset": self.scheduler_slot1_preset_var.get().strip(),
+            "scheduler_slot2_time": self.scheduler_slot2_time_var.get().strip(),
+            "scheduler_slot2_preset": self.scheduler_slot2_preset_var.get().strip(),
             "health_alert_enabled": bool(self.health_alert_enabled_var.get()),
             "health_alert_minutes": self.health_alert_minutes_var.get().strip(),
             "autosave_enabled": bool(self.autosave_enabled_var.get()),
@@ -2998,6 +3323,7 @@ class AntiAfkApp:
             "recovery_enabled": bool(self.recovery_enabled_var.get()),
             "instance_interval_override_by_pid": {str(pid): value for pid, value in self.instance_interval_override.items()},
             "instance_pattern_override_by_pid": {str(pid): value for pid, value in self.instance_pattern_override.items()},
+            "instance_priority_by_pid": {str(pid): value for pid, value in self.instance_priority_by_pid.items()},
         }
 
     def _apply_config_data(self, data: dict[str, Any]) -> None:
@@ -3033,13 +3359,27 @@ class AntiAfkApp:
                         pattern_override[int(k)] = pattern
                     except (TypeError, ValueError):
                         continue
+        raw_priority = data.get("instance_priority_by_pid", {})
+        priority_by_pid: dict[int, int] = {}
+        if isinstance(raw_priority, dict):
+            for k, v in raw_priority.items():
+                try:
+                    parsed = int(v)
+                    if 1 <= parsed <= 9:
+                        priority_by_pid[int(k)] = parsed
+                except (TypeError, ValueError):
+                    continue
 
         self.interval_var.set(interval)
         self.auto_realign_var.set(auto_realign)
         self.loaded_enabled_by_pid = enabled_by_pid
         self.instance_interval_override = interval_override
         self.instance_pattern_override = pattern_override
-        self.jump_mode_var.set(str(data.get("jump_mode", "all")))
+        self.instance_priority_by_pid = priority_by_pid
+        jump_mode = str(data.get("jump_mode", "all")).strip().lower()
+        if jump_mode not in {"all", "round", "weighted"}:
+            jump_mode = "all"
+        self.jump_mode_var.set(jump_mode)
         self.pause_enabled_var.set(bool(data.get("pause_enabled", False)))
         self.pause_start_var.set(str(data.get("pause_start", "02:00")))
         self.pause_end_var.set(str(data.get("pause_end", "06:00")))
@@ -3069,6 +3409,11 @@ class AntiAfkApp:
         self.startup_preset_var.set(str(data.get("startup_preset", "default")).strip() or "default")
         self.startup_auto_start_var.set(bool(data.get("startup_auto_start", False)))
         self.startup_auto_align_var.set(bool(data.get("startup_auto_align", False)))
+        self.scheduler_enabled_var.set(bool(data.get("scheduler_enabled", False)))
+        self.scheduler_slot1_time_var.set(str(data.get("scheduler_slot1_time", "08:00")))
+        self.scheduler_slot1_preset_var.set(str(data.get("scheduler_slot1_preset", "day")))
+        self.scheduler_slot2_time_var.set(str(data.get("scheduler_slot2_time", "23:30")))
+        self.scheduler_slot2_preset_var.set(str(data.get("scheduler_slot2_preset", "overnight")))
         self.health_alert_enabled_var.set(bool(data.get("health_alert_enabled", True)))
         self.health_alert_minutes_var.set(str(data.get("health_alert_minutes", "3")))
         self.autosave_enabled_var.set(bool(data.get("autosave_enabled", True)))
@@ -3181,9 +3526,11 @@ class AntiAfkApp:
             f"Current biome: {self.current_biome_name} ({self.current_biome_source})",
             f"Theme: {self.current_theme_name}",
             f"Anti-idle pattern: {self.anti_idle_pattern_var.get()}",
+            f"Jump mode: {self.jump_mode_var.get()}",
             f"Global hotkeys: {'ON' if self.hotkeys_enabled_var.get() else 'OFF'} (Ctrl+Alt+S/J/R/T/1/2/3)",
             f"Wait for windows mode: {'ON' if self.start_when_windows_found_var.get() else 'OFF'}",
             f"Safe mode: {'ON' if self.safe_mode_var.get() else 'OFF'}",
+            f"Scheduler: {'ON' if self.scheduler_enabled_var.get() else 'OFF'} ({self.scheduler_slot1_time_var.get()}->{self.scheduler_slot1_preset_var.get()}, {self.scheduler_slot2_time_var.get()}->{self.scheduler_slot2_preset_var.get()})",
             f"Instance health alerts: {'ON' if self.health_alert_enabled_var.get() else 'OFF'} ({self.health_alert_minutes_var.get().strip() or '3'} min)",
             f"Recovery auto-save: {'ON' if self.autosave_enabled_var.get() else 'OFF'} ({self.autosave_minutes_var.get().strip() or '2'} min)",
             f"Recovery sequence: {'ON' if self.recovery_enabled_var.get() else 'OFF'}",
@@ -3281,6 +3628,7 @@ class AntiAfkApp:
                     "username": self.pid_username.get(pid, ""),
                     "identity": self.pid_identity_confidence.get(pid, "unknown"),
                     "last_jump": self.instance_last_jump.get(hwnd),
+                    "priority": self.instance_priority_by_pid.get(pid, 1),
                     "interval_override": self.instance_interval_override.get(pid),
                     "pattern_override": self.instance_pattern_override.get(pid, ""),
                     "reliability_percent": reliability,
@@ -3311,6 +3659,7 @@ class AntiAfkApp:
                     "username",
                     "identity",
                     "last_jump",
+                    "priority",
                     "interval_override",
                     "pattern_override",
                     "reliability_percent",
@@ -3389,46 +3738,123 @@ class AntiAfkApp:
         else:
             messagebox.showinfo("Release page", target)
 
-    def check_for_updates(self) -> None:
+    def _start_background_update_check(self) -> None:
+        threading.Thread(target=self._background_update_worker, daemon=True).start()
+
+    def _background_update_worker(self) -> None:
         release = self._fetch_json("https://api.github.com/repos/0bl1terate3/StayActive/releases/latest")
+        try:
+            self.root.after(0, lambda: self._apply_update_info(release, silent=True))
+        except Exception:
+            pass
+
+    def _apply_update_info(self, release: dict[str, Any] | None, silent: bool) -> None:
         if not release:
-            messagebox.showinfo("Updates", "Could not check for updates right now.")
+            self.update_banner_var.set("Update check failed")
+            if not silent:
+                messagebox.showinfo("Updates", "Could not check for updates right now.")
             return
         tag = str(release.get("tag_name", "")).strip()
         url = str(release.get("html_url", "")).strip()
         body = str(release.get("body", "") or "").strip()
+        asset_url = ""
+        asset_name = ""
+        assets = release.get("assets")
+        if isinstance(assets, list):
+            for asset in assets:
+                if not isinstance(asset, dict):
+                    continue
+                candidate_name = str(asset.get("name", "")).strip()
+                candidate_url = str(asset.get("browser_download_url", "")).strip()
+                if candidate_name.lower().endswith(".exe") and candidate_url:
+                    asset_name = candidate_name
+                    asset_url = candidate_url
+                    break
         if url:
             self.latest_release_url = url
+        self.latest_release_asset_url = asset_url
+        self.latest_release_asset_name = asset_name
+        self.latest_release_tag_var.set(f"Latest: {tag or '-'}")
         if not tag:
-            messagebox.showinfo("Updates", "Latest release tag was not found.")
+            self.update_banner_var.set("Latest release tag unavailable")
+            if not silent:
+                messagebox.showinfo("Updates", "Latest release tag was not found.")
             return
-
         latest = self._parse_version_parts(tag)
         current = self._parse_version_parts(APP_VERSION)
-        snippet = ""
-        if body:
-            for line in body.splitlines():
-                s = line.strip()
-                if s:
-                    snippet = s
-                    break
-        if snippet:
-            snippet = f"\n\nNotes: {snippet[:180]}"
-
+        if latest > current:
+            self.update_banner_var.set(f"Update available: {tag}")
+            if not silent:
+                snippet = ""
+                if body:
+                    for line in body.splitlines():
+                        s = line.strip()
+                        if s:
+                            snippet = s[:180]
+                            break
+                notes = f"\n\nNotes: {snippet}" if snippet else ""
+                prompt = f"Latest: {tag}\nCurrent: v{APP_VERSION}\n\nOpen download now?{notes}"
+                if messagebox.askyesno("Update Available", prompt):
+                    self.download_latest_release_asset()
+            return
         if latest == current:
-            messagebox.showinfo("Updates", f"You're up to date ({APP_VERSION}).{snippet}")
-            self._record_event("Update check: up to date")
+            self.update_banner_var.set("You are up to date")
+            if not silent:
+                messagebox.showinfo("Updates", f"You're up to date ({APP_VERSION}).")
             return
-        if latest < current:
-            messagebox.showinfo(
-                "Updates",
-                f"You're on a newer local build (v{APP_VERSION}) than latest release ({tag}).\n\n{url}",
-            )
-            self._record_event(f"Update check: local ahead of {tag}")
+        self.update_banner_var.set("Local build is newer than latest release")
+        if not silent:
+            messagebox.showinfo("Updates", f"You're on a newer local build (v{APP_VERSION}) than latest release ({tag}).")
+
+    def check_for_updates(self) -> None:
+        release = self._fetch_json("https://api.github.com/repos/0bl1terate3/StayActive/releases/latest")
+        self._apply_update_info(release, silent=False)
+        if release and isinstance(release.get("tag_name"), str):
+            self._record_event(f"Update check: {release.get('tag_name')}")
+
+    def download_latest_release_asset(self) -> None:
+        if self.latest_release_asset_url:
+            opened = webbrowser.open(self.latest_release_asset_url)
+            if opened:
+                self._record_event(f"Opened asset: {self.latest_release_asset_name or 'release exe'}")
+                return
+        self.open_latest_release_page()
+
+    def test_webhook_health(self) -> None:
+        if not self.webhook_enabled_var.get():
+            messagebox.showinfo("Webhook test", "Enable webhook first.")
+            return
+        url = self.webhook_url_var.get().strip()
+        if not self._is_valid_webhook_url(url):
+            messagebox.showerror("Webhook test", "Webhook URL must be a valid HTTPS URL.")
             return
 
-        self._record_event(f"Update available: {tag}")
-        messagebox.showinfo("Update Available", f"Latest: {tag}\nCurrent: v{APP_VERSION}\n\n{url}{snippet}")
+        def _worker() -> None:
+            payload = {"content": f"{APP_NAME} webhook test at {datetime.now().strftime('%H:%M:%S')}"}
+            data = json.dumps(payload).encode("utf-8")
+            req = urlrequest.Request(
+                url,
+                data=data,
+                headers={"Content-Type": "application/json", "User-Agent": APP_USER_AGENT},
+                method="POST",
+            )
+            started = time.perf_counter()
+            try:
+                with urlrequest.urlopen(req, timeout=10) as resp:
+                    code = getattr(resp, "status", 204)
+                elapsed_ms = int((time.perf_counter() - started) * 1000)
+                self.root.after(
+                    0,
+                    lambda: messagebox.showinfo(
+                        "Webhook test", f"Success (HTTP {code})\nLatency: {elapsed_ms} ms"
+                    ),
+                )
+                self.log(f"Webhook test success ({elapsed_ms} ms).")
+            except Exception as exc:
+                self.root.after(0, lambda: messagebox.showerror("Webhook test", f"Failed: {exc}"))
+                self.log(f"Webhook test failed: {exc}")
+
+        threading.Thread(target=_worker, daemon=True).start()
 
     def export_portable_bundle(self) -> None:
         stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
@@ -3442,16 +3868,31 @@ class AntiAfkApp:
             return
         self.save_config()
         try:
+            checksums: dict[str, str] = {}
             with zipfile.ZipFile(path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
                 if os.path.exists(self.config_path):
                     zf.write(self.config_path, arcname="stayactive_config.json")
+                    with open(self.config_path, "rb") as handle:
+                        checksums["stayactive_config.json"] = hashlib.sha256(handle.read()).hexdigest()
                 if os.path.exists(self.theme_config_path):
                     zf.write(self.theme_config_path, arcname="stayactive_themes.json")
+                    with open(self.theme_config_path, "rb") as handle:
+                        checksums["stayactive_themes.json"] = hashlib.sha256(handle.read()).hexdigest()
                 if os.path.isdir(self.presets_dir):
                     for name in os.listdir(self.presets_dir):
                         full = os.path.join(self.presets_dir, name)
                         if os.path.isfile(full) and name.lower().endswith(".json"):
-                            zf.write(full, arcname=os.path.join("presets", name))
+                            arc = os.path.join("presets", name).replace("\\", "/")
+                            zf.write(full, arcname=arc)
+                            with open(full, "rb") as handle:
+                                checksums[arc] = hashlib.sha256(handle.read()).hexdigest()
+                metadata = {
+                    "app": APP_NAME,
+                    "version": APP_VERSION,
+                    "exported_at": datetime.now().isoformat(timespec="seconds"),
+                    "checksums_sha256": checksums,
+                }
+                zf.writestr("portable-metadata.json", json.dumps(metadata, indent=2))
             self.log(f"Portable bundle exported: {path}")
             self._record_event("Portable export completed")
         except Exception as exc:
@@ -3464,6 +3905,15 @@ class AntiAfkApp:
         try:
             with zipfile.ZipFile(path, "r") as zf:
                 members = zf.namelist()
+                if "portable-metadata.json" in members:
+                    try:
+                        meta = json.loads(zf.read("portable-metadata.json").decode("utf-8", errors="ignore"))
+                        if isinstance(meta, dict):
+                            src_version = str(meta.get("version", "")).strip()
+                            if src_version:
+                                self.log(f"Portable import metadata version: {src_version}")
+                    except Exception:
+                        pass
                 if "stayactive_config.json" in members:
                     with zf.open("stayactive_config.json") as src, open(self.config_path, "wb") as dst:
                         dst.write(src.read())
@@ -3576,8 +4026,12 @@ class AntiAfkApp:
         self.stop()
         self._write_recovery_snapshot(force=True)
         self.save_config()
+        self._write_session_report("shutdown")
         self._unregister_global_hotkeys()
         self._clear_recovery_state_marker()
+        if self.hotkey_help_window is not None and self.hotkey_help_window.winfo_exists():
+            self.hotkey_help_window.destroy()
+            self.hotkey_help_window = None
         if self.tray_icon is not None:
             self.tray_icon.stop()
             self.tray_icon = None
@@ -3588,7 +4042,17 @@ def main() -> None:
     root = tk.Tk()
     app = AntiAfkApp(root)
     app.log("Ready. Configure instances and press Start.")
-    root.mainloop()
+    try:
+        root.mainloop()
+    except Exception:
+        details = traceback.format_exc()
+        path = app._write_crash_report("main-loop", details)
+        if path:
+            try:
+                messagebox.showerror("Crash", f"Unexpected error. Crash report saved:\n{path}")
+            except Exception:
+                pass
+        raise
 
 
 if __name__ == "__main__":
