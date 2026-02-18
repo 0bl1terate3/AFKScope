@@ -103,7 +103,7 @@ BIOME_ALIAS_MAP: dict[str, str] = {
     "aurora": "AURORA",
 }
 
-APP_VERSION = "0.1.2"
+APP_VERSION = "0.1.3"
 APP_NAME = "StayActive"
 APP_USER_AGENT = f"{APP_NAME}/{APP_VERSION}"
 APP_ICON_ICO = "STAYACTIVE ICON.ico"
@@ -511,7 +511,7 @@ class AntiAfkApp:
         update_banner.pack(fill="x", pady=(4, 0))
         ttk.Label(update_banner, textvariable=self.update_banner_var).pack(side=tk.LEFT)
         ttk.Label(update_banner, textvariable=self.latest_release_tag_var).pack(side=tk.LEFT, padx=(10, 0))
-        ttk.Button(update_banner, text="Download Latest", width=14, command=self.download_latest_release_asset).pack(
+        ttk.Button(update_banner, text="Download Latest", command=self.download_latest_release_asset).pack(
             side=tk.RIGHT
         )
 
@@ -527,7 +527,35 @@ class AntiAfkApp:
         notebook.add(tab_monitor, text="Health & Diagnostics")
         notebook.add(tab_log, text="Live Log")
 
-        quick_access = ttk.LabelFrame(tab_control, text="Quick Start", padding=10)
+        action_bar = ttk.LabelFrame(tab_control, text="Action Bar", padding=8)
+        action_bar.pack(fill="x", pady=(0, 8))
+        self.start_button = ttk.Button(action_bar, text="Start", width=11, command=self.start)
+        self.start_button.pack(side=tk.LEFT, padx=(0, 5))
+        self.stop_button = ttk.Button(action_bar, text="Stop", width=11, command=self.stop, state=tk.DISABLED)
+        self.stop_button.pack(side=tk.LEFT, padx=(0, 5))
+        self.test_button = ttk.Button(action_bar, text="Jump Now", width=11, command=self.test_jump)
+        self.test_button.pack(side=tk.LEFT, padx=(0, 5))
+        ttk.Button(action_bar, text="Pause Now", width=11, command=self.pause_for_minutes).pack(side=tk.LEFT, padx=(0, 5))
+        ttk.Button(action_bar, text="Resume", width=10, command=self.clear_manual_pause).pack(side=tk.LEFT, padx=(0, 10))
+        self.refresh_button = ttk.Button(action_bar, text="Refresh", width=11, command=lambda: self.refresh_instance_list(manual=True))
+        self.refresh_button.pack(side=tk.LEFT, padx=(0, 5))
+        ttk.Button(action_bar, text="Hotkey Help", width=11, command=self.toggle_hotkey_help).pack(side=tk.LEFT, padx=(0, 10))
+        ttk.Label(action_bar, textvariable=self.status_var).pack(side=tk.RIGHT)
+
+        dash_notebook = ttk.Notebook(tab_control)
+        dash_notebook.pack(fill="both", expand=True)
+        dash_run = ttk.Frame(dash_notebook, padding=8)
+        dash_automation = ttk.Frame(dash_notebook, padding=8)
+        dash_alerts = ttk.Frame(dash_notebook, padding=8)
+        dash_startup = ttk.Frame(dash_notebook, padding=8)
+        dash_advanced = ttk.Frame(dash_notebook, padding=8)
+        dash_notebook.add(dash_run, text="Run")
+        dash_notebook.add(dash_automation, text="Automation")
+        dash_notebook.add(dash_alerts, text="Alerts")
+        dash_notebook.add(dash_startup, text="Startup")
+        dash_notebook.add(dash_advanced, text="Advanced")
+
+        quick_access = ttk.LabelFrame(dash_run, text="Quick Start", padding=10)
         quick_access.pack(fill="x", pady=(0, 8))
         ttk.Label(
             quick_access,
@@ -535,16 +563,13 @@ class AntiAfkApp:
         ).pack(anchor="w")
         qa_actions = ttk.Frame(quick_access)
         qa_actions.pack(fill="x", pady=(6, 0))
-        ttk.Button(qa_actions, text="Refresh Instances", width=16, command=lambda: self.refresh_instance_list(manual=True)).pack(
-            side=tk.LEFT
-        )
+        ttk.Button(qa_actions, text="Refresh Instances", width=16, command=lambda: self.refresh_instance_list(manual=True)).pack(side=tk.LEFT)
         ttk.Button(qa_actions, text="Run Diagnostics", width=14, command=self.run_diagnostics_checks).pack(side=tk.LEFT, padx=(6, 0))
-        ttk.Button(qa_actions, text="Hotkey Help", width=12, command=self.toggle_hotkey_help).pack(side=tk.LEFT, padx=(6, 0))
-        ttk.Button(qa_actions, text="Check Updates", width=12, command=self.check_for_updates).pack(side=tk.LEFT, padx=(6, 0))
+        ttk.Button(qa_actions, text="Check Updates", command=self.check_for_updates).pack(side=tk.LEFT, padx=(6, 0))
+        ttk.Button(qa_actions, text="Download Latest", command=self.download_latest_release_asset).pack(side=tk.LEFT, padx=(6, 0))
 
-        controls_group = ttk.LabelFrame(tab_control, text="Main Controls", padding=10)
+        controls_group = ttk.LabelFrame(dash_run, text="Core Runtime", padding=10)
         controls_group.pack(fill="x")
-
         row1 = ttk.Frame(controls_group)
         row1.pack(fill="x")
         ttk.Label(row1, text="Jump interval (seconds):").pack(side=tk.LEFT)
@@ -555,72 +580,22 @@ class AntiAfkApp:
         ttk.Radiobutton(row1, text="Round-robin", variable=self.jump_mode_var, value="round").pack(side=tk.LEFT)
         ttk.Radiobutton(row1, text="Weighted", variable=self.jump_mode_var, value="weighted").pack(side=tk.LEFT, padx=(8, 0))
 
-        row2 = ttk.Frame(controls_group)
-        row2.pack(fill="x", pady=(8, 0))
-        self.start_button = ttk.Button(row2, text="Start", width=11, command=self.start)
-        self.start_button.pack(side=tk.LEFT, padx=(0, 5))
-        self.stop_button = ttk.Button(row2, text="Stop", width=11, command=self.stop, state=tk.DISABLED)
-        self.stop_button.pack(side=tk.LEFT, padx=(0, 5))
-        self.test_button = ttk.Button(row2, text="Jump Now", width=11, command=self.test_jump)
-        self.test_button.pack(side=tk.LEFT, padx=(0, 5))
-        self.refresh_button = ttk.Button(row2, text="Refresh", width=11, command=lambda: self.refresh_instance_list(manual=True))
-        self.refresh_button.pack(side=tk.LEFT, padx=(0, 5))
-        self.align_button = ttk.Button(row2, text="Align", width=11, command=self.align_windows)
-        self.align_button.pack(side=tk.LEFT, padx=(0, 5))
-        self.restore_button = ttk.Button(row2, text="Restore", width=11, command=self.restore_windows)
-        self.restore_button.pack(side=tk.LEFT, padx=(0, 5))
-        ttk.Button(row2, text="Retry Identity", width=13, command=self.retry_selected_identity).pack(side=tk.LEFT, padx=(0, 5))
-        ttk.Button(row2, text="To Tray", width=11, command=self.minimize_to_tray).pack(side=tk.LEFT)
-
-        row3 = ttk.Frame(controls_group)
-        row3.pack(fill="x", pady=(8, 0))
-        self.save_button = ttk.Button(row3, text="Save Config", width=12, command=self.save_config)
-        self.save_button.pack(side=tk.LEFT, padx=(0, 5))
-        self.load_button = ttk.Button(row3, text="Load Config", width=12, command=lambda: self.load_config(silent=False))
-        self.load_button.pack(side=tk.LEFT, padx=(0, 10))
-        ttk.Button(row3, text="Export JSON", width=12, command=lambda: self.export_instances("json")).pack(side=tk.LEFT, padx=(0, 5))
-        ttk.Button(row3, text="Export CSV", width=12, command=lambda: self.export_instances("csv")).pack(side=tk.LEFT, padx=(0, 10))
-        ttk.Button(row3, text="Build EXE", width=12, command=self.build_exe).pack(side=tk.LEFT)
-
-        preset_row = ttk.Frame(controls_group)
-        preset_row.pack(fill="x", pady=(8, 0))
-        ttk.Label(preset_row, text="Profile preset:").pack(side=tk.LEFT)
+        preset_group = ttk.LabelFrame(dash_run, text="Profiles", padding=10)
+        preset_group.pack(fill="x", pady=(8, 0))
+        preset_row = ttk.Frame(preset_group)
+        preset_row.pack(fill="x")
+        ttk.Label(preset_row, text="Active preset:").pack(side=tk.LEFT)
         self.preset_combo = ttk.Combobox(preset_row, textvariable=self.preset_name_var, width=24, state="normal")
         self.preset_combo.pack(side=tk.LEFT, padx=(8, 8))
-        ttk.Button(preset_row, text="Save Preset", width=12, command=self.save_preset).pack(side=tk.LEFT, padx=(0, 5))
         ttk.Button(preset_row, text="Load Preset", width=12, command=self.load_preset).pack(side=tk.LEFT, padx=(0, 5))
+        ttk.Button(preset_row, text="Save Preset", width=12, command=self.save_preset).pack(side=tk.LEFT, padx=(0, 5))
         ttk.Button(preset_row, text="Delete Preset", width=12, command=self.delete_preset).pack(side=tk.LEFT, padx=(0, 5))
         ttk.Button(preset_row, text="Refresh Presets", width=14, command=self._refresh_preset_list).pack(side=tk.LEFT)
-        ttk.Button(preset_row, text="Open Presets", width=12, command=self.open_presets_folder).pack(side=tk.LEFT, padx=(5, 0))
 
-        options_group = ttk.LabelFrame(tab_control, text="Automation Options", padding=10)
-        options_group.pack(fill="x", pady=(8, 0))
-
-        opt1 = ttk.Frame(options_group)
-        opt1.pack(fill="x")
-        ttk.Checkbutton(opt1, text="Safe pause schedule", variable=self.pause_enabled_var).pack(side=tk.LEFT)
-        ttk.Label(opt1, text="Start HH:MM").pack(side=tk.LEFT, padx=(10, 4))
-        ttk.Entry(opt1, textvariable=self.pause_start_var, width=6, justify="center").pack(side=tk.LEFT)
-        ttk.Label(opt1, text="End HH:MM").pack(side=tk.LEFT, padx=(10, 4))
-        ttk.Entry(opt1, textvariable=self.pause_end_var, width=6, justify="center").pack(side=tk.LEFT)
-
-        opt2 = ttk.Frame(options_group)
-        opt2.pack(fill="x", pady=(6, 0))
-        ttk.Checkbutton(opt2, text="Discord webhook alerts", variable=self.webhook_enabled_var).pack(side=tk.LEFT)
-        ttk.Entry(opt2, textvariable=self.webhook_url_var, width=70).pack(side=tk.LEFT, padx=(8, 0))
-        ttk.Button(opt2, text="Test Webhook", width=12, command=self.test_webhook_health).pack(side=tk.LEFT, padx=(8, 0))
-
-        opt3 = ttk.Frame(options_group)
-        opt3.pack(fill="x", pady=(6, 0))
-        ttk.Checkbutton(opt3, text="Watchdog", variable=self.watchdog_enabled_var).pack(side=tk.LEFT)
-        ttk.Label(opt3, text="No windows cycles:").pack(side=tk.LEFT, padx=(10, 4))
-        ttk.Entry(opt3, textvariable=self.watchdog_no_windows_threshold_var, width=5, justify="center").pack(side=tk.LEFT)
-        ttk.Label(opt3, text="Jump-fail cycles:").pack(side=tk.LEFT, padx=(10, 4))
-        ttk.Entry(opt3, textvariable=self.watchdog_jump_fail_threshold_var, width=5, justify="center").pack(side=tk.LEFT)
-        ttk.Checkbutton(opt3, text="Recovery sequence", variable=self.recovery_enabled_var).pack(side=tk.LEFT, padx=(12, 0))
-
-        pattern_row = ttk.Frame(options_group)
-        pattern_row.pack(fill="x", pady=(6, 0))
+        runtime_group = ttk.LabelFrame(dash_automation, text="Loop Behavior", padding=10)
+        runtime_group.pack(fill="x")
+        pattern_row = ttk.Frame(runtime_group)
+        pattern_row.pack(fill="x")
         ttk.Label(pattern_row, text="Anti-idle pattern:").pack(side=tk.LEFT)
         self.pattern_combo = ttk.Combobox(
             pattern_row,
@@ -629,53 +604,68 @@ class AntiAfkApp:
             width=12,
             state="readonly",
         )
-        self.pattern_combo.pack(side=tk.LEFT, padx=(8, 0))
-
-        hotkey_row = ttk.Frame(options_group)
-        hotkey_row.pack(fill="x", pady=(6, 0))
+        self.pattern_combo.pack(side=tk.LEFT, padx=(8, 12))
         ttk.Checkbutton(
-            hotkey_row,
-            text="Global hotkeys (Ctrl+Alt+S/J/R/T/1/2/3)",
-            variable=self.hotkeys_enabled_var,
-            command=self.on_hotkeys_toggle,
-        ).pack(side=tk.LEFT)
-
-        practical_row = ttk.Frame(options_group)
-        practical_row.pack(fill="x", pady=(6, 0))
-        ttk.Checkbutton(
-            practical_row,
+            pattern_row,
             text="Wait for Roblox windows before sending jumps",
             variable=self.start_when_windows_found_var,
         ).pack(side=tk.LEFT)
         ttk.Checkbutton(
-            practical_row,
+            pattern_row,
             text="Safe mode (slower/more conservative)",
             variable=self.safe_mode_var,
         ).pack(side=tk.LEFT, padx=(12, 0))
 
-        pause_quick_row = ttk.Frame(options_group)
+        watchdog_group = ttk.LabelFrame(dash_automation, text="Watchdog & Recovery", padding=10)
+        watchdog_group.pack(fill="x", pady=(8, 0))
+        opt3 = ttk.Frame(watchdog_group)
+        opt3.pack(fill="x")
+        ttk.Checkbutton(opt3, text="Watchdog", variable=self.watchdog_enabled_var).pack(side=tk.LEFT)
+        ttk.Label(opt3, text="No windows cycles:").pack(side=tk.LEFT, padx=(10, 4))
+        ttk.Entry(opt3, textvariable=self.watchdog_no_windows_threshold_var, width=5, justify="center").pack(side=tk.LEFT)
+        ttk.Label(opt3, text="Jump-fail cycles:").pack(side=tk.LEFT, padx=(10, 4))
+        ttk.Entry(opt3, textvariable=self.watchdog_jump_fail_threshold_var, width=5, justify="center").pack(side=tk.LEFT)
+        ttk.Checkbutton(opt3, text="Recovery sequence", variable=self.recovery_enabled_var).pack(side=tk.LEFT, padx=(12, 0))
+
+        pause_group = ttk.LabelFrame(dash_automation, text="Pause Controls", padding=10)
+        pause_group.pack(fill="x", pady=(8, 0))
+        opt1 = ttk.Frame(pause_group)
+        opt1.pack(fill="x")
+        ttk.Checkbutton(opt1, text="Safe pause schedule", variable=self.pause_enabled_var).pack(side=tk.LEFT)
+        ttk.Label(opt1, text="Start HH:MM").pack(side=tk.LEFT, padx=(10, 4))
+        ttk.Entry(opt1, textvariable=self.pause_start_var, width=6, justify="center").pack(side=tk.LEFT)
+        ttk.Label(opt1, text="End HH:MM").pack(side=tk.LEFT, padx=(10, 4))
+        ttk.Entry(opt1, textvariable=self.pause_end_var, width=6, justify="center").pack(side=tk.LEFT)
+        pause_quick_row = ttk.Frame(pause_group)
         pause_quick_row.pack(fill="x", pady=(6, 0))
         ttk.Label(pause_quick_row, text="Quick pause (minutes):").pack(side=tk.LEFT)
-        ttk.Entry(pause_quick_row, textvariable=self.manual_pause_minutes_var, width=5, justify="center").pack(
-            side=tk.LEFT, padx=(8, 6)
-        )
+        ttk.Entry(pause_quick_row, textvariable=self.manual_pause_minutes_var, width=5, justify="center").pack(side=tk.LEFT, padx=(8, 6))
         ttk.Button(pause_quick_row, text="Pause Now", width=10, command=self.pause_for_minutes).pack(side=tk.LEFT)
         ttk.Button(pause_quick_row, text="Resume", width=10, command=self.clear_manual_pause).pack(side=tk.LEFT, padx=(6, 0))
 
-        health_row = ttk.Frame(options_group)
-        health_row.pack(fill="x", pady=(6, 0))
+        webhook_group = ttk.LabelFrame(dash_alerts, text="Webhook Alerts", padding=10)
+        webhook_group.pack(fill="x")
+        opt2 = ttk.Frame(webhook_group)
+        opt2.pack(fill="x")
+        ttk.Button(opt2, text="Test Webhook", command=self.test_webhook_health).pack(side=tk.RIGHT, padx=(8, 0))
+        ttk.Entry(opt2, textvariable=self.webhook_url_var).pack(side=tk.RIGHT, fill="x", expand=True, padx=(8, 0))
+        ttk.Checkbutton(opt2, text="Discord webhook alerts", variable=self.webhook_enabled_var).pack(side=tk.LEFT)
+
+        health_group_controls = ttk.LabelFrame(dash_alerts, text="Instance Health Alerts", padding=10)
+        health_group_controls.pack(fill="x", pady=(8, 0))
+        health_row = ttk.Frame(health_group_controls)
+        health_row.pack(fill="x")
         ttk.Checkbutton(health_row, text="Instance health alerts", variable=self.health_alert_enabled_var).pack(side=tk.LEFT)
         ttk.Label(health_row, text="No jump threshold (minutes):").pack(side=tk.LEFT, padx=(10, 4))
         ttk.Entry(health_row, textvariable=self.health_alert_minutes_var, width=5, justify="center").pack(side=tk.LEFT)
-        ttk.Checkbutton(health_row, text="Auto-save recovery snapshot", variable=self.autosave_enabled_var).pack(
-            side=tk.LEFT,
-            padx=(12, 0),
-        )
+        ttk.Checkbutton(health_row, text="Auto-save recovery snapshot", variable=self.autosave_enabled_var).pack(side=tk.LEFT, padx=(12, 0))
         ttk.Label(health_row, text="Every (minutes):").pack(side=tk.LEFT, padx=(8, 4))
         ttk.Entry(health_row, textvariable=self.autosave_minutes_var, width=5, justify="center").pack(side=tk.LEFT)
 
-        biome_row = ttk.Frame(options_group)
-        biome_row.pack(fill="x", pady=(8, 0))
+        biome_group = ttk.LabelFrame(dash_alerts, text="Biome Alerts", padding=10)
+        biome_group.pack(fill="x", pady=(8, 0))
+        biome_row = ttk.Frame(biome_group)
+        biome_row.pack(fill="x")
         ttk.Label(biome_row, text="Current biome:").pack(side=tk.LEFT)
         self.biome_badge = tk.Label(
             biome_row,
@@ -688,8 +678,7 @@ class AntiAfkApp:
         )
         self.biome_badge.pack(side=tk.LEFT, padx=(8, 8))
         ttk.Label(biome_row, textvariable=self.biome_meta_var).pack(side=tk.LEFT)
-
-        alert_row = ttk.Frame(options_group)
+        alert_row = ttk.Frame(biome_group)
         alert_row.pack(fill="x", pady=(6, 0))
         ttk.Checkbutton(alert_row, text="Rare biome webhook alerts", variable=self.biome_alerts_enabled_var).pack(side=tk.LEFT)
         ttk.Label(alert_row, text="Tracked rare biome:").pack(side=tk.LEFT, padx=(10, 4))
@@ -701,8 +690,7 @@ class AntiAfkApp:
             state="readonly",
         )
         self.rare_biome_combo.pack(side=tk.LEFT)
-
-        action_row = ttk.Frame(options_group)
+        action_row = ttk.Frame(biome_group)
         action_row.pack(fill="x", pady=(6, 0))
         ttk.Label(action_row, text="Rare biome action:").pack(side=tk.LEFT)
         self.biome_action_combo = ttk.Combobox(
@@ -716,13 +704,11 @@ class AntiAfkApp:
         ttk.Label(action_row, text="Preset").pack(side=tk.LEFT)
         ttk.Entry(action_row, textvariable=self.biome_action_preset_var, width=16).pack(side=tk.LEFT, padx=(6, 0))
 
-        startup_row = ttk.Frame(options_group)
-        startup_row.pack(fill="x", pady=(8, 0))
-        ttk.Checkbutton(
-            startup_row,
-            text="Startup restore",
-            variable=self.startup_restore_enabled_var,
-        ).pack(side=tk.LEFT)
+        startup_group = ttk.LabelFrame(dash_startup, text="Startup Behavior", padding=10)
+        startup_group.pack(fill="x")
+        startup_row = ttk.Frame(startup_group)
+        startup_row.pack(fill="x")
+        ttk.Checkbutton(startup_row, text="Startup restore", variable=self.startup_restore_enabled_var).pack(side=tk.LEFT)
         ttk.Label(startup_row, text="Preset:").pack(side=tk.LEFT, padx=(10, 4))
         self.startup_preset_combo = ttk.Combobox(
             startup_row,
@@ -734,18 +720,10 @@ class AntiAfkApp:
         ttk.Checkbutton(startup_row, text="Auto-start", variable=self.startup_auto_start_var).pack(side=tk.LEFT, padx=(10, 0))
         ttk.Checkbutton(startup_row, text="Auto-align", variable=self.startup_auto_align_var).pack(side=tk.LEFT, padx=(8, 0))
 
-        quick_profiles_row = ttk.Frame(options_group)
-        quick_profiles_row.pack(fill="x", pady=(6, 0))
-        ttk.Label(quick_profiles_row, text="Hotkey profiles Ctrl+Alt+1/2/3:").pack(side=tk.LEFT)
-        self.profile_hotkey_1_entry = ttk.Entry(quick_profiles_row, textvariable=self.profile_hotkey_1_var, width=12)
-        self.profile_hotkey_1_entry.pack(side=tk.LEFT, padx=(8, 4))
-        self.profile_hotkey_2_entry = ttk.Entry(quick_profiles_row, textvariable=self.profile_hotkey_2_var, width=12)
-        self.profile_hotkey_2_entry.pack(side=tk.LEFT, padx=4)
-        self.profile_hotkey_3_entry = ttk.Entry(quick_profiles_row, textvariable=self.profile_hotkey_3_var, width=12)
-        self.profile_hotkey_3_entry.pack(side=tk.LEFT, padx=4)
-
-        scheduler_row = ttk.Frame(options_group)
-        scheduler_row.pack(fill="x", pady=(6, 0))
+        scheduler_group = ttk.LabelFrame(dash_startup, text="Scheduler", padding=10)
+        scheduler_group.pack(fill="x", pady=(8, 0))
+        scheduler_row = ttk.Frame(scheduler_group)
+        scheduler_row.pack(fill="x")
         ttk.Checkbutton(scheduler_row, text="Profile scheduler", variable=self.scheduler_enabled_var).pack(side=tk.LEFT)
         ttk.Label(scheduler_row, text="Slot 1").pack(side=tk.LEFT, padx=(10, 3))
         ttk.Entry(scheduler_row, textvariable=self.scheduler_slot1_time_var, width=6, justify="center").pack(side=tk.LEFT)
@@ -753,6 +731,48 @@ class AntiAfkApp:
         ttk.Label(scheduler_row, text="Slot 2").pack(side=tk.LEFT, padx=(6, 3))
         ttk.Entry(scheduler_row, textvariable=self.scheduler_slot2_time_var, width=6, justify="center").pack(side=tk.LEFT)
         ttk.Entry(scheduler_row, textvariable=self.scheduler_slot2_preset_var, width=12).pack(side=tk.LEFT, padx=(4, 0))
+
+        hotkey_profile_group = ttk.LabelFrame(dash_startup, text="Hotkey Profiles", padding=10)
+        hotkey_profile_group.pack(fill="x", pady=(8, 0))
+        hotkey_row = ttk.Frame(hotkey_profile_group)
+        hotkey_row.pack(fill="x")
+        ttk.Checkbutton(
+            hotkey_row,
+            text="Global hotkeys (Ctrl+Alt+S/J/R/T/1/2/3)",
+            variable=self.hotkeys_enabled_var,
+            command=self.on_hotkeys_toggle,
+        ).pack(side=tk.LEFT)
+        quick_profiles_row = ttk.Frame(hotkey_profile_group)
+        quick_profiles_row.pack(fill="x", pady=(6, 0))
+        ttk.Label(quick_profiles_row, text="Profiles for Ctrl+Alt+1/2/3:").pack(side=tk.LEFT)
+        self.profile_hotkey_1_entry = ttk.Entry(quick_profiles_row, textvariable=self.profile_hotkey_1_var, width=12)
+        self.profile_hotkey_1_entry.pack(side=tk.LEFT, padx=(8, 4))
+        self.profile_hotkey_2_entry = ttk.Entry(quick_profiles_row, textvariable=self.profile_hotkey_2_var, width=12)
+        self.profile_hotkey_2_entry.pack(side=tk.LEFT, padx=4)
+        self.profile_hotkey_3_entry = ttk.Entry(quick_profiles_row, textvariable=self.profile_hotkey_3_var, width=12)
+        self.profile_hotkey_3_entry.pack(side=tk.LEFT, padx=4)
+
+        advanced_tools_group = ttk.LabelFrame(dash_advanced, text="Advanced Tools", padding=10)
+        advanced_tools_group.pack(fill="x")
+        row2 = ttk.Frame(advanced_tools_group)
+        row2.pack(fill="x")
+        self.align_button = ttk.Button(row2, text="Align", width=11, command=self.align_windows)
+        self.align_button.pack(side=tk.LEFT, padx=(0, 5))
+        self.restore_button = ttk.Button(row2, text="Restore", width=11, command=self.restore_windows)
+        self.restore_button.pack(side=tk.LEFT, padx=(0, 5))
+        ttk.Button(row2, text="Retry Identity", width=13, command=self.retry_selected_identity).pack(side=tk.LEFT, padx=(0, 5))
+        ttk.Button(row2, text="To Tray", width=11, command=self.minimize_to_tray).pack(side=tk.LEFT, padx=(0, 5))
+        ttk.Button(row2, text="Open Presets", width=12, command=self.open_presets_folder).pack(side=tk.LEFT, padx=(0, 5))
+
+        row3 = ttk.Frame(advanced_tools_group)
+        row3.pack(fill="x", pady=(8, 0))
+        self.save_button = ttk.Button(row3, text="Save Config", width=12, command=self.save_config)
+        self.save_button.pack(side=tk.LEFT, padx=(0, 5))
+        self.load_button = ttk.Button(row3, text="Load Config", width=12, command=lambda: self.load_config(silent=False))
+        self.load_button.pack(side=tk.LEFT, padx=(0, 10))
+        ttk.Button(row3, text="Export JSON", width=12, command=lambda: self.export_instances("json")).pack(side=tk.LEFT, padx=(0, 5))
+        ttk.Button(row3, text="Export CSV", width=12, command=lambda: self.export_instances("csv")).pack(side=tk.LEFT, padx=(0, 10))
+        ttk.Button(row3, text="Build EXE", width=12, command=self.build_exe).pack(side=tk.LEFT)
 
         history_group = ttk.LabelFrame(tab_monitor, text="Biome Alert History", padding=8)
         history_group.pack(fill="x", pady=(8, 0))
@@ -859,8 +879,8 @@ class AntiAfkApp:
         diag_row.pack(fill="x", pady=(0, 6))
         ttk.Button(diag_row, text="Run Checks", width=12, command=self.run_diagnostics_checks).pack(side=tk.LEFT, padx=(0, 5))
         ttk.Button(diag_row, text="Export Debug Bundle", width=18, command=self.export_debug_bundle).pack(side=tk.LEFT)
-        ttk.Button(diag_row, text="Check Updates", width=13, command=self.check_for_updates).pack(side=tk.LEFT, padx=(5, 5))
-        ttk.Button(diag_row, text="Download Latest", width=14, command=self.download_latest_release_asset).pack(side=tk.LEFT, padx=(0, 5))
+        ttk.Button(diag_row, text="Check Updates", command=self.check_for_updates).pack(side=tk.LEFT, padx=(5, 5))
+        ttk.Button(diag_row, text="Download Latest", command=self.download_latest_release_asset).pack(side=tk.LEFT, padx=(0, 5))
         ttk.Button(diag_row, text="Open Release", width=12, command=self.open_latest_release_page).pack(side=tk.LEFT, padx=(0, 5))
         ttk.Button(diag_row, text="Hotkey Help", width=12, command=self.toggle_hotkey_help).pack(side=tk.LEFT, padx=(0, 5))
         ttk.Button(diag_row, text="Copy Diag", width=10, command=self.copy_diagnostics_to_clipboard).pack(side=tk.LEFT, padx=(0, 5))
