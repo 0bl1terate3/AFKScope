@@ -112,6 +112,12 @@ pip install pystray pillow
 - Biome badge/history + rare biome Discord webhook alerts.
 - Header theme dropdown with many distinct color themes.
 - In-app Theme Maker with custom theme save/delete and live preview.
+- Theme Maker import/export for shareable JSON theme files.
+- First-launch Quick Setup Wizard for baseline configuration.
+- Global hotkeys (`Ctrl+Alt+S/J/R/T`) for start/stop, jump, refresh, and tray.
+- Instance health alerts when enabled instances stop receiving jumps.
+- Auto-save recovery snapshots with restore prompt after unclean shutdown.
+- One-click clipboard support bundle for faster troubleshooting.
 - Smart anti-idle patterns: `balanced`, `subtle`, `aggressive`, `randomized`.
 - Identity detection from logs with Roblox API enrichment.
 - Session stats, watchdog recovery sequence, and safe pause schedule.
@@ -120,6 +126,15 @@ pip install pystray pillow
 - Config save/load, portable bundle import/export, JSON/CSV export, and debug bundle export.
 - Dedicated AFKScope header logo for clearer branding/readability.
 - Event timeline panel and copy-to-clipboard diagnostics utilities.
+
+## Patch Notes (v0.2.8)
+
+- Added first-launch Quick Setup Wizard.
+- Added global hotkeys (`Ctrl+Alt+S/J/R/T`) for common actions.
+- Added Theme Maker import/export for JSON theme files.
+- Added instance health alerts for stale/no-jump enabled instances.
+- Added auto-save recovery snapshots plus restore prompt after unclean shutdown.
+- Added one-click clipboard support bundle for diagnostics + recent events/logs.
 
 ## Patch Notes (v0.2.7)
 
@@ -151,7 +166,7 @@ Output: `dist/AFKScope.exe`
 
 - If the app process exists but no window appears:
   Ensure ViGEmBus is installed and running.
-  Use the latest release build (`v0.2.7+`) which includes startup/import fixes and QoL diagnostics improvements.
+  Use the latest release build (`v0.2.8+`) which includes startup/import fixes and QoL diagnostics improvements.
 - If PyInstaller hangs on Python 3.14:
   Build with Python 3.10 (`py -3.10`) as shown above.
 

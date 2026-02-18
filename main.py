@@ -17,7 +17,7 @@ from ctypes import wintypes
 from datetime import datetime
 from pathlib import Path
 from tkinter import colorchooser, filedialog, messagebox, ttk
-from typing import Any, cast
+from typing import Any, Callable, cast
 from urllib import error as urlerror
 from urllib import parse as urlparse
 from urllib import request as urlrequest
@@ -100,9 +100,13 @@ BIOME_ALIAS_MAP: dict[str, str] = {
     "aurora": "AURORA",
 }
 
-APP_VERSION = "0.2.7"
+APP_VERSION = "0.2.8"
 APP_USER_AGENT = f"AFKScope/{APP_VERSION}"
 THEME_COLOR_KEYS = ("bg", "panel", "field", "text", "muted", "accent", "tree_sel", "tree_selfg")
+WM_HOTKEY = 0x0312
+PM_REMOVE = 0x0001
+MOD_ALT = 0x0001
+MOD_CONTROL = 0x0002
 
 
 class AntiAfkApp:
@@ -142,7 +146,10 @@ class AntiAfkApp:
         self.gamepad: Any | None = None
         self.config_path = os.path.join(os.getcwd(), "afkscope_config.json")
         self.theme_config_path = os.path.join(os.getcwd(), "afkscope_themes.json")
+        self.recovery_state_path = os.path.join(os.getcwd(), "afkscope_recovery_state.json")
+        self.recovery_snapshot_path = os.path.join(os.getcwd(), "afkscope_recovery_snapshot.json")
         self.presets_dir = os.path.join(os.getcwd(), "presets")
+        self.should_offer_setup_wizard = not os.path.exists(self.config_path)
 
         self.interval_var = tk.StringVar(value="5")
         self.status_var = tk.StringVar(value="Idle")
@@ -151,6 +158,11 @@ class AntiAfkApp:
         self.jump_mode_var = tk.StringVar(value="all")
         self.theme_name_var = tk.StringVar(value="Midnight")
         self.anti_idle_pattern_var = tk.StringVar(value="balanced")
+        self.hotkeys_enabled_var = tk.BooleanVar(value=True)
+        self.health_alert_enabled_var = tk.BooleanVar(value=True)
+        self.health_alert_minutes_var = tk.StringVar(value="3")
+        self.autosave_enabled_var = tk.BooleanVar(value=True)
+        self.autosave_minutes_var = tk.StringVar(value="2")
 
         self.pause_enabled_var = tk.BooleanVar(value=False)
         self.pause_start_var = tk.StringVar(value="02:00")
@@ -193,9 +205,15 @@ class AntiAfkApp:
 
         self.failed_cycles = 0
         self.round_robin_index = 0
+        self.last_instance_health_alert: dict[int, float] = {}
+        self.last_autosave_at = 0.0
+        self.recovery_prompt_needed = self._detect_unclean_shutdown()
+        self.quick_setup_window: tk.Toplevel | None = None
 
         self.tray_icon = None
         self.tray_enabled = False
+        self.hotkey_actions: dict[int, tuple[str, Callable[[], None]]] = {}
+        self.global_hotkeys_registered = False
 
         self.current_theme_name = "Midnight"
         self.theme_palettes: dict[str, dict[str, str]] = {
@@ -286,6 +304,7 @@ class AntiAfkApp:
         os.makedirs(self.presets_dir, exist_ok=True)
         self._refresh_preset_list()
         self.load_config(silent=True)
+        self._write_recovery_state_marker()
         self._ensure_window_visible()
         self.root.after(50, self._finish_startup)
 
@@ -307,8 +326,15 @@ class AntiAfkApp:
         try:
             self.refresh_instance_list(manual=False)
             self.run_diagnostics_checks()
+            self._set_global_hotkeys_enabled(self.hotkeys_enabled_var.get(), log_result=False)
             self._schedule_stats_update()
             self._schedule_instance_poll()
+            self._schedule_recovery_autosave()
+            if self.recovery_prompt_needed:
+                self.log("Detected previous unclean shutdown state.")
+                self.root.after(250, self._prompt_recovery_restore)
+            if self.should_offer_setup_wizard:
+                self.root.after(350, self.open_quick_setup_wizard)
         except Exception as exc:
             self.log(f"Startup checks failed: {exc}")
 
@@ -507,6 +533,27 @@ class AntiAfkApp:
         )
         self.pattern_combo.pack(side=tk.LEFT, padx=(8, 0))
 
+        hotkey_row = ttk.Frame(options_group)
+        hotkey_row.pack(fill="x", pady=(6, 0))
+        ttk.Checkbutton(
+            hotkey_row,
+            text="Global hotkeys (Ctrl+Alt+S/J/R/T)",
+            variable=self.hotkeys_enabled_var,
+            command=self.on_hotkeys_toggle,
+        ).pack(side=tk.LEFT)
+
+        health_row = ttk.Frame(options_group)
+        health_row.pack(fill="x", pady=(6, 0))
+        ttk.Checkbutton(health_row, text="Instance health alerts", variable=self.health_alert_enabled_var).pack(side=tk.LEFT)
+        ttk.Label(health_row, text="No jump threshold (minutes):").pack(side=tk.LEFT, padx=(10, 4))
+        ttk.Entry(health_row, textvariable=self.health_alert_minutes_var, width=5, justify="center").pack(side=tk.LEFT)
+        ttk.Checkbutton(health_row, text="Auto-save recovery snapshot", variable=self.autosave_enabled_var).pack(
+            side=tk.LEFT,
+            padx=(12, 0),
+        )
+        ttk.Label(health_row, text="Every (minutes):").pack(side=tk.LEFT, padx=(8, 4))
+        ttk.Entry(health_row, textvariable=self.autosave_minutes_var, width=5, justify="center").pack(side=tk.LEFT)
+
         biome_row = ttk.Frame(options_group)
         biome_row.pack(fill="x", pady=(8, 0))
         ttk.Label(biome_row, text="Current biome:").pack(side=tk.LEFT)
@@ -616,6 +663,7 @@ class AntiAfkApp:
         ttk.Button(diag_row, text="Check Updates", width=13, command=self.check_for_updates).pack(side=tk.LEFT, padx=(5, 5))
         ttk.Button(diag_row, text="Open Release", width=12, command=self.open_latest_release_page).pack(side=tk.LEFT, padx=(0, 5))
         ttk.Button(diag_row, text="Copy Diag", width=10, command=self.copy_diagnostics_to_clipboard).pack(side=tk.LEFT, padx=(0, 5))
+        ttk.Button(diag_row, text="Copy Support", width=12, command=self.copy_support_bundle_to_clipboard).pack(side=tk.LEFT, padx=(0, 5))
         ttk.Button(diag_row, text="Export Portable", width=14, command=self.export_portable_bundle).pack(side=tk.LEFT, padx=(0, 5))
         ttk.Button(diag_row, text="Import Portable", width=14, command=self.import_portable_bundle).pack(side=tk.LEFT)
         self.diagnostics_text = tk.Text(diag_group, height=5, font=("Consolas", 9), state=tk.DISABLED)
@@ -792,6 +840,8 @@ class AntiAfkApp:
         ttk.Button(button_row, text="Preview", width=12, command=self._theme_maker_preview).pack(side=tk.LEFT)
         ttk.Button(button_row, text="Save Theme", width=12, command=self._theme_maker_save).pack(side=tk.LEFT, padx=(6, 0))
         ttk.Button(button_row, text="Delete Theme", width=12, command=self._theme_maker_delete).pack(side=tk.LEFT, padx=(6, 0))
+        ttk.Button(button_row, text="Import Theme", width=12, command=self._theme_maker_import).pack(side=tk.LEFT, padx=(6, 0))
+        ttk.Button(button_row, text="Export Theme", width=12, command=self._theme_maker_export).pack(side=tk.LEFT, padx=(6, 0))
         ttk.Button(button_row, text="Close", width=10, command=self._theme_maker_on_close).pack(side=tk.RIGHT)
 
         ttk.Label(
@@ -938,6 +988,94 @@ class AntiAfkApp:
             self.theme_maker_name_var.set(self.theme_name_var.get().strip())
         self._theme_maker_load_selected()
         self.log(f"Theme deleted: {existing_name}")
+
+    def _make_unique_custom_theme_name(self, base_name: str) -> str:
+        name = self._normalize_theme_name(base_name) or "Custom Theme"
+        if name in self.default_theme_names:
+            name = f"{name} Custom"
+        if name not in self.theme_palettes:
+            return name
+        for i in range(2, 200):
+            candidate = f"{name} {i}"
+            if candidate not in self.theme_palettes:
+                return candidate
+        return f"{name} {int(time.time())}"
+
+    def _theme_maker_export(self) -> None:
+        raw_name = self.theme_maker_name_var.get() if self.theme_maker_name_var is not None else self.theme_name_var.get()
+        name = self._normalize_theme_name(raw_name) or "Custom Theme"
+        try:
+            palette = self._theme_maker_collect_palette()
+        except Exception:
+            palette = dict(self.current_palette)
+
+        default_name = f"{self._sanitize_preset_name(name).lower()}-theme.json"
+        path = filedialog.asksaveasfilename(
+            defaultextension=".json",
+            initialfile=default_name,
+            filetypes=[("JSON", "*.json")],
+        )
+        if not path:
+            return
+        payload = {
+            "name": name,
+            "palette": palette,
+            "exported_at": datetime.now().isoformat(timespec="seconds"),
+            "version": APP_VERSION,
+        }
+        try:
+            with open(path, "w", encoding="utf-8") as handle:
+                json.dump(payload, handle, indent=2)
+            self.log(f"Theme exported: {path}")
+        except Exception as exc:
+            messagebox.showerror("Theme Maker", f"Could not export theme: {exc}")
+
+    def _theme_maker_import(self) -> None:
+        path = filedialog.askopenfilename(filetypes=[("JSON", "*.json")])
+        if not path:
+            return
+        try:
+            with open(path, "r", encoding="utf-8") as handle:
+                data = json.load(handle)
+        except Exception as exc:
+            messagebox.showerror("Theme Maker", f"Could not read file: {exc}")
+            return
+
+        raw_name = os.path.splitext(os.path.basename(path))[0]
+        raw_palette: Any = None
+        if isinstance(data, dict):
+            if "palette" in data:
+                raw_palette = data.get("palette")
+                name_value = data.get("name")
+                if isinstance(name_value, str) and name_value.strip():
+                    raw_name = name_value
+            elif all(key in data for key in THEME_COLOR_KEYS):
+                raw_palette = data
+            else:
+                # Also allow {"Theme A": {...palette...}} shape by taking first valid entry.
+                for key, value in data.items():
+                    candidate = self._normalize_theme_palette(value)
+                    if candidate is not None:
+                        raw_palette = candidate
+                        if isinstance(key, str) and key.strip():
+                            raw_name = key
+                        break
+
+        palette = self._normalize_theme_palette(raw_palette)
+        if palette is None:
+            messagebox.showerror("Theme Maker", "Imported file does not contain a valid AFKScope theme palette.")
+            return
+
+        name = self._make_unique_custom_theme_name(raw_name)
+        if self.theme_maker_name_var is not None:
+            self.theme_maker_name_var.set(name)
+        for key in THEME_COLOR_KEYS:
+            var = self.theme_maker_color_vars.get(key)
+            if var is not None:
+                var.set(palette[key])
+        self._theme_maker_update_all_swatches()
+        self._theme_maker_save()
+        self.log(f"Theme imported: {name}")
 
     def _apply_selected_theme(self) -> None:
         name = self.theme_name_var.get().strip()
@@ -1267,6 +1405,26 @@ class AntiAfkApp:
             raise ValueError("Watchdog threshold must be >= 1.")
         return value
 
+    def parse_health_alert_minutes(self) -> int:
+        raw = self.health_alert_minutes_var.get().strip()
+        try:
+            value = int(raw)
+        except ValueError as exc:
+            raise ValueError("Health alert minutes must be an integer.") from exc
+        if value < 1:
+            raise ValueError("Health alert minutes must be >= 1.")
+        return value
+
+    def parse_autosave_minutes(self) -> int:
+        raw = self.autosave_minutes_var.get().strip()
+        try:
+            value = int(raw)
+        except ValueError as exc:
+            raise ValueError("Auto-save minutes must be an integer.") from exc
+        if value < 1:
+            raise ValueError("Auto-save minutes must be >= 1.")
+        return value
+
     @staticmethod
     def _parse_hhmm(raw: str, label: str) -> tuple[int, int]:
         text = raw.strip()
@@ -1300,6 +1458,10 @@ class AntiAfkApp:
     def validate_runtime_settings(self) -> None:
         self.parse_interval()
         self.parse_watchdog_threshold()
+        if self.health_alert_enabled_var.get():
+            self.parse_health_alert_minutes()
+        if self.autosave_enabled_var.get():
+            self.parse_autosave_minutes()
         self._validate_pause_schedule()
         if self.webhook_enabled_var.get():
             url = self.webhook_url_var.get().strip()
@@ -1307,6 +1469,241 @@ class AntiAfkApp:
                 raise ValueError("Webhook is enabled but URL is empty.")
             if not self._is_valid_webhook_url(url):
                 raise ValueError("Webhook URL must be a valid HTTPS URL.")
+
+    def _detect_unclean_shutdown(self) -> bool:
+        if not os.path.exists(self.recovery_state_path):
+            return False
+        return True
+
+    def _write_recovery_state_marker(self) -> None:
+        payload = {
+            "pid": os.getpid(),
+            "started_at": datetime.now().isoformat(timespec="seconds"),
+            "version": APP_VERSION,
+        }
+        try:
+            with open(self.recovery_state_path, "w", encoding="utf-8") as handle:
+                json.dump(payload, handle, indent=2)
+        except Exception:
+            pass
+
+    def _clear_recovery_state_marker(self) -> None:
+        try:
+            if os.path.exists(self.recovery_state_path):
+                os.remove(self.recovery_state_path)
+        except Exception:
+            pass
+
+    def _write_recovery_snapshot(self, force: bool = False) -> None:
+        if not self.autosave_enabled_var.get() and not force:
+            return
+        try:
+            every_minutes = self.parse_autosave_minutes()
+        except ValueError:
+            every_minutes = 2
+        now = time.time()
+        if not force and (now - self.last_autosave_at) < (every_minutes * 60):
+            return
+        payload = {
+            "saved_at": datetime.now().isoformat(timespec="seconds"),
+            "version": APP_VERSION,
+            "config": self._collect_config_data(),
+            "runtime": {
+                "is_running": self.is_running,
+                "session_started_at": self.session_started_at,
+                "session_cycles": self.session_cycles,
+                "session_jumps": self.session_jumps,
+                "session_errors": self.session_errors,
+            },
+        }
+        try:
+            with open(self.recovery_snapshot_path, "w", encoding="utf-8") as handle:
+                json.dump(payload, handle, indent=2)
+            self.last_autosave_at = now
+        except Exception:
+            pass
+
+    def _schedule_recovery_autosave(self) -> None:
+        self._write_recovery_snapshot(force=False)
+        self.root.after(30_000, self._schedule_recovery_autosave)
+
+    def _prompt_recovery_restore(self) -> None:
+        if not self.recovery_prompt_needed:
+            return
+        self.recovery_prompt_needed = False
+        if not os.path.exists(self.recovery_snapshot_path):
+            return
+        try:
+            with open(self.recovery_snapshot_path, "r", encoding="utf-8") as handle:
+                payload = json.load(handle)
+            if not isinstance(payload, dict):
+                return
+            raw_config = payload.get("config")
+            if not isinstance(raw_config, dict):
+                return
+        except Exception:
+            return
+
+        restore = messagebox.askyesno(
+            "Recovery Snapshot Found",
+            "AFKScope detected a previous unclean shutdown.\n\nRestore settings from the latest auto-save snapshot?",
+        )
+        if not restore:
+            self.log("Recovery snapshot skipped by user.")
+            return
+        try:
+            self._apply_config_data(raw_config)
+            self.log("Recovered settings from auto-save snapshot.")
+            self._record_event("Recovery snapshot restored")
+        except Exception as exc:
+            self.log(f"Recovery restore failed: {exc}")
+
+    def open_quick_setup_wizard(self) -> None:
+        if self.quick_setup_window is not None and self.quick_setup_window.winfo_exists():
+            self.quick_setup_window.lift()
+            self.quick_setup_window.focus_force()
+            return
+        self.should_offer_setup_wizard = False
+
+        window = tk.Toplevel(self.root)
+        self.quick_setup_window = window
+        window.title("Quick Setup Wizard")
+        window.geometry("540x320")
+        window.minsize(540, 320)
+        window.resizable(False, False)
+        window.transient(self.root)
+        window.protocol("WM_DELETE_WINDOW", self._close_quick_setup_wizard)
+
+        container = ttk.Frame(window, padding=12)
+        container.pack(fill="both", expand=True)
+
+        ttk.Label(
+            container,
+            text="Welcome to AFKScope. Configure a safe baseline and save it in one step.",
+            font=("Segoe UI", 10, "bold"),
+        ).pack(anchor="w")
+        ttk.Label(
+            container,
+            text="You can change all settings later in the Controls tab.",
+        ).pack(anchor="w", pady=(4, 10))
+
+        interval_var = tk.StringVar(value=self.interval_var.get())
+        jump_mode_var = tk.StringVar(value=self.jump_mode_var.get())
+        auto_realign_var = tk.BooleanVar(value=self.auto_realign_var.get())
+        hotkeys_var = tk.BooleanVar(value=self.hotkeys_enabled_var.get())
+
+        grid = ttk.Frame(container)
+        grid.pack(fill="x")
+        ttk.Label(grid, text="Jump interval (seconds):").grid(row=0, column=0, sticky="w")
+        ttk.Entry(grid, textvariable=interval_var, width=8, justify="center").grid(row=0, column=1, sticky="w", padx=(6, 0))
+        ttk.Label(grid, text="Jump mode:").grid(row=1, column=0, sticky="w", pady=(8, 0))
+        ttk.Combobox(grid, textvariable=jump_mode_var, values=["all", "round"], state="readonly", width=10).grid(
+            row=1,
+            column=1,
+            sticky="w",
+            padx=(6, 0),
+            pady=(8, 0),
+        )
+        ttk.Checkbutton(grid, text="Auto realign windows", variable=auto_realign_var).grid(row=2, column=0, columnspan=2, sticky="w", pady=(10, 0))
+        ttk.Checkbutton(grid, text="Enable global hotkeys", variable=hotkeys_var).grid(row=3, column=0, columnspan=2, sticky="w", pady=(6, 0))
+
+        actions = ttk.Frame(container)
+        actions.pack(fill="x", pady=(14, 0))
+        ttk.Button(actions, text="Detect Roblox Windows", width=22, command=lambda: self.refresh_instance_list(manual=True)).pack(
+            side=tk.LEFT
+        )
+
+        def _apply_and_save() -> None:
+            self.interval_var.set(interval_var.get().strip())
+            self.jump_mode_var.set(jump_mode_var.get().strip() or "all")
+            self.auto_realign_var.set(bool(auto_realign_var.get()))
+            self.hotkeys_enabled_var.set(bool(hotkeys_var.get()))
+            try:
+                self.validate_runtime_settings()
+                self.save_config()
+                self.on_hotkeys_toggle()
+                self.log("Quick setup wizard applied.")
+                self._record_event("Quick setup completed")
+            except Exception as exc:
+                messagebox.showerror("Quick Setup", str(exc))
+                return
+            self._close_quick_setup_wizard()
+
+        ttk.Button(actions, text="Apply & Save", width=14, command=_apply_and_save).pack(side=tk.RIGHT)
+        ttk.Button(actions, text="Skip", width=10, command=self._close_quick_setup_wizard).pack(side=tk.RIGHT, padx=(0, 6))
+
+    def _close_quick_setup_wizard(self) -> None:
+        if self.quick_setup_window is not None and self.quick_setup_window.winfo_exists():
+            self.quick_setup_window.destroy()
+        self.quick_setup_window = None
+
+    def on_hotkeys_toggle(self) -> None:
+        self._set_global_hotkeys_enabled(self.hotkeys_enabled_var.get(), log_result=True)
+
+    def _set_global_hotkeys_enabled(self, enabled: bool, log_result: bool) -> None:
+        if enabled:
+            ok = self._register_global_hotkeys()
+            if ok and log_result:
+                self.log("Global hotkeys enabled (Ctrl+Alt+S/J/R/T).")
+            elif not ok and log_result:
+                self.log("Global hotkeys unavailable (some combinations may already be in use).")
+            self.hotkeys_enabled_var.set(ok)
+        else:
+            self._unregister_global_hotkeys()
+            if log_result:
+                self.log("Global hotkeys disabled.")
+
+    def _register_global_hotkeys(self) -> bool:
+        if self.global_hotkeys_registered:
+            return True
+        self.hotkey_actions.clear()
+        combos: list[tuple[int, str, int, Callable[[], None]]] = [
+            (1, "Start/Stop", ord("S"), lambda: self.stop() if self.is_running else self.start()),
+            (2, "Jump Now", ord("J"), self.test_jump),
+            (3, "Refresh", ord("R"), lambda: self.refresh_instance_list(manual=True)),
+            (4, "To Tray", ord("T"), self.minimize_to_tray),
+        ]
+        registered_count = 0
+        for hotkey_id, label, vk, action in combos:
+            ok = self.user32.RegisterHotKey(None, hotkey_id, MOD_CONTROL | MOD_ALT, vk)
+            if ok:
+                self.hotkey_actions[hotkey_id] = (label, action)
+                registered_count += 1
+        if registered_count != len(combos):
+            self._unregister_global_hotkeys()
+            return False
+        self.global_hotkeys_registered = registered_count > 0
+        if self.global_hotkeys_registered:
+            self.root.after(150, self._poll_global_hotkeys)
+        return self.global_hotkeys_registered
+
+    def _unregister_global_hotkeys(self) -> None:
+        for hotkey_id in list(self.hotkey_actions.keys()):
+            try:
+                self.user32.UnregisterHotKey(None, hotkey_id)
+            except Exception:
+                pass
+        self.hotkey_actions.clear()
+        self.global_hotkeys_registered = False
+
+    def _poll_global_hotkeys(self) -> None:
+        if not self.global_hotkeys_registered:
+            return
+        msg = wintypes.MSG()
+        try:
+            while self.user32.PeekMessageW(ctypes.byref(msg), None, WM_HOTKEY, WM_HOTKEY, PM_REMOVE):
+                if int(msg.message) != WM_HOTKEY:
+                    continue
+                hotkey_id = int(msg.wParam)
+                entry = self.hotkey_actions.get(hotkey_id)
+                if not entry:
+                    continue
+                label, action = entry
+                self._record_event(f"Hotkey: {label}")
+                self.root.after(0, action)
+        except Exception:
+            pass
+        self.root.after(120, self._poll_global_hotkeys)
 
     def _ensure_vgamepad_module(self) -> Any:
         global vg, vg_import_error, vg_import_attempted
@@ -2049,12 +2446,14 @@ class AntiAfkApp:
         self.worker_thread = threading.Thread(target=self.worker, args=(interval,), daemon=True)
         self.worker_thread.start()
         self.set_running_ui(True)
+        self._write_recovery_snapshot(force=True)
 
     def stop(self) -> None:
         self.stop_event.set()
         if self.worker_thread and self.worker_thread.is_alive():
             self.worker_thread.join(timeout=0.5)
         self.set_running_ui(False)
+        self._write_recovery_snapshot(force=True)
 
     def _schedule_stats_update(self) -> None:
         with self.metrics_lock:
@@ -2075,7 +2474,42 @@ class AntiAfkApp:
     def _schedule_instance_poll(self) -> None:
         self.refresh_instance_list(manual=False)
         self._poll_biome_tracker()
+        self._check_instance_health_alerts()
         self.root.after(2500, self._schedule_instance_poll)
+
+    def _check_instance_health_alerts(self) -> None:
+        active_hwnds = {hwnd for hwnd, _title, _pid, _pname in self.window_map}
+        self.last_instance_health_alert = {
+            hwnd: ts for hwnd, ts in self.last_instance_health_alert.items() if hwnd in active_hwnds
+        }
+        if not self.is_running or not self.health_alert_enabled_var.get():
+            return
+        try:
+            threshold_seconds = self.parse_health_alert_minutes() * 60
+        except ValueError:
+            threshold_seconds = 180
+        now = time.time()
+        for hwnd, _title, pid, _pname in self.window_map:
+            if not self.instance_enabled_by_hwnd.get(hwnd, True):
+                continue
+            baseline = self.instance_last_jump.get(hwnd)
+            if baseline is None:
+                baseline = self.session_started_at if self.session_started_at is not None else now
+            gap = now - baseline
+            if gap < threshold_seconds:
+                continue
+            last_alert = self.last_instance_health_alert.get(hwnd, 0.0)
+            if now - last_alert < threshold_seconds:
+                continue
+            self.last_instance_health_alert[hwnd] = now
+            username = self.pid_username.get(pid, "unknown")
+            msg = (
+                f"No successful jump for PID {pid} ({username}) "
+                f"for {int(gap // 60)}m {int(gap % 60)}s."
+            )
+            self.log(f"Instance health alert: {msg}")
+            self._record_event(f"Health alert: PID {pid}")
+            self._send_webhook("AFKScope Instance Health Alert", msg)
 
     def _enabled_by_pid_snapshot(self) -> dict[int, bool]:
         mapping: dict[int, bool] = {}
@@ -2098,6 +2532,11 @@ class AntiAfkApp:
             "watchdog_threshold": self.watchdog_threshold_var.get().strip(),
             "theme_name": self.theme_name_var.get().strip(),
             "anti_idle_pattern": self.anti_idle_pattern_var.get().strip(),
+            "hotkeys_enabled": bool(self.hotkeys_enabled_var.get()),
+            "health_alert_enabled": bool(self.health_alert_enabled_var.get()),
+            "health_alert_minutes": self.health_alert_minutes_var.get().strip(),
+            "autosave_enabled": bool(self.autosave_enabled_var.get()),
+            "autosave_minutes": self.autosave_minutes_var.get().strip(),
             "biome_alerts_enabled": bool(self.biome_alerts_enabled_var.get()),
             "rare_biome": self.rare_biome_var.get().strip().upper(),
             "biome_action": self.biome_action_var.get().strip(),
@@ -2137,6 +2576,11 @@ class AntiAfkApp:
         if anti_pattern not in {"balanced", "subtle", "aggressive", "randomized"}:
             anti_pattern = "balanced"
         self.anti_idle_pattern_var.set(anti_pattern)
+        self.hotkeys_enabled_var.set(bool(data.get("hotkeys_enabled", True)))
+        self.health_alert_enabled_var.set(bool(data.get("health_alert_enabled", True)))
+        self.health_alert_minutes_var.set(str(data.get("health_alert_minutes", "3")))
+        self.autosave_enabled_var.set(bool(data.get("autosave_enabled", True)))
+        self.autosave_minutes_var.set(str(data.get("autosave_minutes", "2")))
         self.biome_alerts_enabled_var.set(bool(data.get("biome_alerts_enabled", False)))
         self.rare_biome_var.set(str(data.get("rare_biome", "GLITCHED")).strip().upper() or "GLITCHED")
         biome_action = str(data.get("biome_action", "webhook")).strip().lower()
@@ -2146,6 +2590,7 @@ class AntiAfkApp:
         self.biome_action_preset_var.set(str(data.get("biome_action_preset", "default")).strip())
         self.recovery_enabled_var.set(bool(data.get("recovery_enabled", True)))
         self._apply_selected_theme()
+        self._set_global_hotkeys_enabled(self.hotkeys_enabled_var.get(), log_result=False)
         self.refresh_instance_list(manual=False)
 
     @staticmethod
@@ -2240,6 +2685,9 @@ class AntiAfkApp:
             f"Current biome: {self.current_biome_name} ({self.current_biome_source})",
             f"Theme: {self.current_theme_name}",
             f"Anti-idle pattern: {self.anti_idle_pattern_var.get()}",
+            f"Global hotkeys: {'ON' if self.hotkeys_enabled_var.get() else 'OFF'} (Ctrl+Alt+S/J/R/T)",
+            f"Instance health alerts: {'ON' if self.health_alert_enabled_var.get() else 'OFF'} ({self.health_alert_minutes_var.get().strip() or '3'} min)",
+            f"Recovery auto-save: {'ON' if self.autosave_enabled_var.get() else 'OFF'} ({self.autosave_minutes_var.get().strip() or '2'} min)",
             f"Recovery sequence: {'ON' if self.recovery_enabled_var.get() else 'OFF'}",
             f"Webhook configured: {'YES' if webhook_on else 'NO'}",
             f"Webhook URL validation: {webhook_validation}",
@@ -2390,6 +2838,28 @@ class AntiAfkApp:
             self._record_event("Diagnostics copied")
         except Exception as exc:
             messagebox.showerror("Copy diagnostics failed", str(exc))
+
+    def copy_support_bundle_to_clipboard(self) -> None:
+        try:
+            self.run_diagnostics_checks()
+            diagnostics_lines = self.diagnostics_text.get("1.0", tk.END).strip().splitlines()
+            log_tail = self.log_box.get("1.0", tk.END).splitlines()[-140:]
+            payload = {
+                "version": APP_VERSION,
+                "generated_at": datetime.now().isoformat(timespec="seconds"),
+                "diagnostics": diagnostics_lines,
+                "settings": self._collect_config_data(),
+                "recent_events": self.event_timeline[-60:],
+                "recent_log_tail": log_tail,
+            }
+            text = json.dumps(payload, indent=2)
+            self.root.clipboard_clear()
+            self.root.clipboard_append(text)
+            self.root.update()
+            self.log("Support bundle copied to clipboard.")
+            self._record_event("Support bundle copied")
+        except Exception as exc:
+            messagebox.showerror("Copy support bundle failed", str(exc))
 
     def open_latest_release_page(self) -> None:
         target = self.latest_release_url or "https://github.com/0bl1terate3/AFKScope/releases/latest"
@@ -2581,7 +3051,10 @@ class AntiAfkApp:
 
     def on_close(self) -> None:
         self.stop()
+        self._write_recovery_snapshot(force=True)
         self.save_config()
+        self._unregister_global_hotkeys()
+        self._clear_recovery_state_marker()
         if self.tray_icon is not None:
             self.tray_icon.stop()
             self.tray_icon = None
