@@ -1,4 +1,4 @@
-import base64
+﻿import base64
 import csv
 import ctypes
 import json
@@ -10,6 +10,7 @@ import sys
 import threading
 import time
 import tkinter as tk
+import zipfile
 from ctypes import wintypes
 from datetime import datetime
 from pathlib import Path
@@ -106,6 +107,7 @@ class AntiAfkApp:
         self.is_running = False
         self.gamepad: Any | None = None
         self.config_path = os.path.join(os.getcwd(), "afkscope_config.json")
+        self.presets_dir = os.path.join(os.getcwd(), "presets")
 
         self.interval_var = tk.StringVar(value="5")
         self.status_var = tk.StringVar(value="Idle")
@@ -123,6 +125,9 @@ class AntiAfkApp:
 
         self.watchdog_enabled_var = tk.BooleanVar(value=True)
         self.watchdog_threshold_var = tk.StringVar(value="12")
+        self.preset_name_var = tk.StringVar(value="default")
+        self.biome_alerts_enabled_var = tk.BooleanVar(value=False)
+        self.rare_biome_var = tk.StringVar(value="GLITCHED")
 
         self.window_map: list[tuple[int, str, int, str]] = []
         self._process_name_cache: dict[int, str] = {}
@@ -203,6 +208,9 @@ class AntiAfkApp:
         self.biome_meta_var = tk.StringVar(value="Source: -")
         self.biome_log_path: str | None = None
         self.biome_log_offset = 0
+        self.biome_history: list[str] = []
+        self.biome_alert_cooldown_seconds = 45
+        self.last_biome_alert_at: dict[str, float] = {}
 
         self._bloxstrap_presence_pattern = re.compile(
             r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d+Z,.*\[FLog::Output\]\s+\[BloxstrapRPC\]\s+(?P<payload>\{.*\})$"
@@ -231,10 +239,14 @@ class AntiAfkApp:
         ]
 
         self._build_ui()
+        self._update_theme_toggle_icon()
         self._apply_theme(self.palette_light)
         self._render_biome_badge()
+        os.makedirs(self.presets_dir, exist_ok=True)
+        self._refresh_preset_list()
         self.load_config(silent=True)
         self.refresh_instance_list(manual=False)
+        self.run_diagnostics_checks()
         self._schedule_stats_update()
         self._schedule_instance_poll()
 
@@ -254,7 +266,7 @@ class AntiAfkApp:
         header.pack(fill="x", pady=(0, 8))
         self.theme_toggle_btn = ttk.Button(
             header,
-            text="☀",
+            text="\u2600",
             width=3,
             command=self.toggle_dark_mode_button,
         )
@@ -304,6 +316,16 @@ class AntiAfkApp:
         ttk.Button(row3, text="Export CSV", width=12, command=lambda: self.export_instances("csv")).pack(side=tk.LEFT, padx=(0, 10))
         ttk.Button(row3, text="Build EXE", width=12, command=self.build_exe).pack(side=tk.LEFT)
 
+        preset_row = ttk.Frame(controls_group)
+        preset_row.pack(fill="x", pady=(8, 0))
+        ttk.Label(preset_row, text="Profile preset:").pack(side=tk.LEFT)
+        self.preset_combo = ttk.Combobox(preset_row, textvariable=self.preset_name_var, width=24, state="normal")
+        self.preset_combo.pack(side=tk.LEFT, padx=(8, 8))
+        ttk.Button(preset_row, text="Save Preset", width=12, command=self.save_preset).pack(side=tk.LEFT, padx=(0, 5))
+        ttk.Button(preset_row, text="Load Preset", width=12, command=self.load_preset).pack(side=tk.LEFT, padx=(0, 5))
+        ttk.Button(preset_row, text="Delete Preset", width=12, command=self.delete_preset).pack(side=tk.LEFT, padx=(0, 5))
+        ttk.Button(preset_row, text="Refresh Presets", width=14, command=self._refresh_preset_list).pack(side=tk.LEFT)
+
         options_group = ttk.LabelFrame(container, text="Automation Options", padding=10)
         options_group.pack(fill="x", pady=(8, 0))
 
@@ -340,6 +362,24 @@ class AntiAfkApp:
         )
         self.biome_badge.pack(side=tk.LEFT, padx=(8, 8))
         ttk.Label(biome_row, textvariable=self.biome_meta_var).pack(side=tk.LEFT)
+
+        alert_row = ttk.Frame(options_group)
+        alert_row.pack(fill="x", pady=(6, 0))
+        ttk.Checkbutton(alert_row, text="Rare biome webhook alerts", variable=self.biome_alerts_enabled_var).pack(side=tk.LEFT)
+        ttk.Label(alert_row, text="Tracked rare biome:").pack(side=tk.LEFT, padx=(10, 4))
+        self.rare_biome_combo = ttk.Combobox(
+            alert_row,
+            textvariable=self.rare_biome_var,
+            values=["GLITCHED", "NULL", "DREAMSPACE", "CORRUPTION", "STARFALL", "HEAVEN", "AURORA", "BLOOD RAIN"],
+            width=14,
+            state="readonly",
+        )
+        self.rare_biome_combo.pack(side=tk.LEFT)
+
+        history_group = ttk.LabelFrame(container, text="Biome Alert History", padding=8)
+        history_group.pack(fill="x", pady=(8, 0))
+        self.biome_history_list = tk.Listbox(history_group, height=4)
+        self.biome_history_list.pack(fill="x")
 
         target_group = ttk.LabelFrame(container, text="Per Instance Controls", padding=10)
         target_group.pack(fill="both", expand=True, pady=(8, 0))
@@ -388,6 +428,15 @@ class AntiAfkApp:
         health_group.pack(fill="x", pady=(8, 0))
         self.health_text = tk.Text(health_group, height=4, font=("Consolas", 9), state=tk.DISABLED)
         self.health_text.pack(fill="x")
+
+        diag_group = ttk.LabelFrame(container, text="Diagnostics", padding=10)
+        diag_group.pack(fill="x", pady=(8, 0))
+        diag_row = ttk.Frame(diag_group)
+        diag_row.pack(fill="x", pady=(0, 6))
+        ttk.Button(diag_row, text="Run Checks", width=12, command=self.run_diagnostics_checks).pack(side=tk.LEFT, padx=(0, 5))
+        ttk.Button(diag_row, text="Export Debug Bundle", width=18, command=self.export_debug_bundle).pack(side=tk.LEFT)
+        self.diagnostics_text = tk.Text(diag_group, height=5, font=("Consolas", 9), state=tk.DISABLED)
+        self.diagnostics_text.pack(fill="x")
 
         status_row = ttk.Frame(container)
         status_row.pack(fill="x", pady=(8, 4))
@@ -468,7 +517,7 @@ class AntiAfkApp:
         self.style.configure("Treeview.Heading", background=palette["panel"], foreground=palette["text"])
         self.style.map("Treeview", background=[("selected", palette["tree_sel"])], foreground=[("selected", palette["tree_selfg"])])
 
-        for widget in (self.log_box, self.health_text):
+        for widget in (self.log_box, self.health_text, self.diagnostics_text):
             widget.configure(
                 bg=palette["field"],
                 fg=palette["text"],
@@ -476,6 +525,14 @@ class AntiAfkApp:
                 highlightbackground=palette["panel"],
                 highlightcolor=palette["accent"],
             )
+        self.biome_history_list.configure(
+            bg=palette["field"],
+            fg=palette["text"],
+            highlightbackground=palette["panel"],
+            highlightcolor=palette["accent"],
+            selectbackground=palette["tree_sel"],
+            selectforeground=palette["tree_selfg"],
+        )
         if hasattr(self, "biome_badge"):
             self.biome_badge.configure(
                 highlightbackground=palette["panel"],
@@ -512,7 +569,7 @@ class AntiAfkApp:
 
     def _update_theme_toggle_icon(self) -> None:
         if hasattr(self, "theme_toggle_btn"):
-            self.theme_toggle_btn.configure(text="☾" if self.dark_mode_var.get() else "☀")
+            self.theme_toggle_btn.configure(text="\u263e" if self.dark_mode_var.get() else "\u2600")
 
     def toggle_dark_mode(self) -> None:
         target = 1.0 if self.dark_mode_var.get() else 0.0
@@ -608,6 +665,29 @@ class AntiAfkApp:
         if hasattr(self, "biome_badge"):
             self.biome_badge.configure(bg=color, fg=fg)
 
+    def _append_biome_history(self, biome: str, source: str) -> None:
+        stamp = time.strftime("%H:%M:%S")
+        line = f"{stamp} | {biome} | {source}"
+        self.biome_history.append(line)
+        self.biome_history = self.biome_history[-120:]
+        if hasattr(self, "biome_history_list"):
+            self.biome_history_list.delete(0, tk.END)
+            for item in self.biome_history[-40:]:
+                self.biome_history_list.insert(tk.END, item)
+
+    def _maybe_send_biome_alert(self, biome: str) -> None:
+        if not self.biome_alerts_enabled_var.get():
+            return
+        tracked = self.rare_biome_var.get().strip().upper()
+        if not tracked or biome != tracked:
+            return
+        now = time.time()
+        last = self.last_biome_alert_at.get(biome, 0.0)
+        if now - last < self.biome_alert_cooldown_seconds:
+            return
+        self.last_biome_alert_at[biome] = now
+        self._send_webhook("AFKScope Rare Biome", f"Detected tracked rare biome: {biome}")
+
     def _set_current_biome(self, biome: str, source: str) -> None:
         if biome not in BIOME_COLOR_MAP:
             return
@@ -618,6 +698,8 @@ class AntiAfkApp:
         if changed:
             self.biome_counts[biome] = self.biome_counts.get(biome, 0) + 1
             self.log(f"Biome detected: {biome} ({source}).")
+            self._append_biome_history(biome, source)
+            self._maybe_send_biome_alert(biome)
         self._render_biome_badge()
 
     def _poll_biome_tracker(self) -> None:
@@ -1447,8 +1529,8 @@ class AntiAfkApp:
             mapping[pid] = self.instance_enabled_by_hwnd.get(hwnd, True)
         return mapping
 
-    def save_config(self) -> None:
-        data = {
+    def _collect_config_data(self) -> dict[str, Any]:
+        return {
             "interval_seconds": self.interval_var.get().strip(),
             "auto_realign": bool(self.auto_realign_var.get()),
             "enabled_by_pid": {str(pid): enabled for pid, enabled in self._enabled_by_pid_snapshot().items()},
@@ -1461,7 +1543,169 @@ class AntiAfkApp:
             "watchdog_enabled": bool(self.watchdog_enabled_var.get()),
             "watchdog_threshold": self.watchdog_threshold_var.get().strip(),
             "dark_mode": bool(self.dark_mode_var.get()),
+            "biome_alerts_enabled": bool(self.biome_alerts_enabled_var.get()),
+            "rare_biome": self.rare_biome_var.get().strip().upper(),
         }
+
+    def _apply_config_data(self, data: dict[str, Any]) -> None:
+        interval = str(data.get("interval_seconds", "5"))
+        auto_realign = bool(data.get("auto_realign", False))
+        raw_enabled = data.get("enabled_by_pid", {})
+        enabled_by_pid: dict[int, bool] = {}
+        if isinstance(raw_enabled, dict):
+            for k, v in raw_enabled.items():
+                try:
+                    enabled_by_pid[int(k)] = bool(v)
+                except (TypeError, ValueError):
+                    continue
+
+        self.interval_var.set(interval)
+        self.auto_realign_var.set(auto_realign)
+        self.loaded_enabled_by_pid = enabled_by_pid
+        self.jump_mode_var.set(str(data.get("jump_mode", "all")))
+        self.pause_enabled_var.set(bool(data.get("pause_enabled", False)))
+        self.pause_start_var.set(str(data.get("pause_start", "02:00")))
+        self.pause_end_var.set(str(data.get("pause_end", "06:00")))
+        self.webhook_enabled_var.set(bool(data.get("webhook_enabled", False)))
+        self.webhook_url_var.set(str(data.get("webhook_url", "")))
+        self.watchdog_enabled_var.set(bool(data.get("watchdog_enabled", True)))
+        self.watchdog_threshold_var.set(str(data.get("watchdog_threshold", "12")))
+        self.dark_mode_var.set(bool(data.get("dark_mode", False)))
+        self.biome_alerts_enabled_var.set(bool(data.get("biome_alerts_enabled", False)))
+        self.rare_biome_var.set(str(data.get("rare_biome", "GLITCHED")).strip().upper() or "GLITCHED")
+        self.current_theme_t = 1.0 if self.dark_mode_var.get() else 0.0
+        self._update_theme_toggle_icon()
+        self._apply_theme(self._theme_at(self.current_theme_t))
+        self.refresh_instance_list(manual=False)
+
+    @staticmethod
+    def _sanitize_preset_name(name: str) -> str:
+        cleaned = re.sub(r"[^A-Za-z0-9_-]+", "_", name.strip())
+        return cleaned[:48].strip("_") or "default"
+
+    def _preset_path(self, preset_name: str) -> str:
+        return os.path.join(self.presets_dir, f"{self._sanitize_preset_name(preset_name)}.json")
+
+    def _refresh_preset_list(self) -> None:
+        os.makedirs(self.presets_dir, exist_ok=True)
+        names: list[str] = []
+        try:
+            for entry in os.listdir(self.presets_dir):
+                if entry.lower().endswith(".json"):
+                    names.append(os.path.splitext(entry)[0])
+        except OSError:
+            names = []
+        names = sorted(set(names))
+        if not names:
+            names = ["default"]
+        self.preset_combo.configure(values=names)
+        if self.preset_name_var.get().strip() not in names:
+            self.preset_name_var.set(names[0])
+
+    def save_preset(self) -> None:
+        name = self._sanitize_preset_name(self.preset_name_var.get())
+        path = self._preset_path(name)
+        data = self._collect_config_data()
+        try:
+            with open(path, "w", encoding="utf-8") as handle:
+                json.dump(data, handle, indent=2)
+            self.preset_name_var.set(name)
+            self._refresh_preset_list()
+            self.log(f"Preset saved: {name}")
+        except Exception as exc:
+            messagebox.showerror("Save preset failed", str(exc))
+
+    def load_preset(self) -> None:
+        name = self._sanitize_preset_name(self.preset_name_var.get())
+        path = self._preset_path(name)
+        if not os.path.exists(path):
+            messagebox.showinfo("Preset", f"Preset not found: {name}")
+            return
+        try:
+            with open(path, "r", encoding="utf-8") as handle:
+                data = json.load(handle)
+            if not isinstance(data, dict):
+                raise ValueError("Preset file is invalid.")
+            self._apply_config_data(data)
+            self.log(f"Preset loaded: {name}")
+        except Exception as exc:
+            messagebox.showerror("Load preset failed", str(exc))
+
+    def delete_preset(self) -> None:
+        name = self._sanitize_preset_name(self.preset_name_var.get())
+        if name == "default":
+            messagebox.showinfo("Preset", "Default preset cannot be deleted.")
+            return
+        path = self._preset_path(name)
+        if not os.path.exists(path):
+            messagebox.showinfo("Preset", f"Preset not found: {name}")
+            return
+        try:
+            os.remove(path)
+            self.log(f"Preset deleted: {name}")
+            self._refresh_preset_list()
+        except Exception as exc:
+            messagebox.showerror("Delete preset failed", str(exc))
+
+    def run_diagnostics_checks(self) -> None:
+        windows = self.find_roblox_windows()
+        latest_log = self._find_latest_biome_log() or "none"
+        webhook_on = self.webhook_enabled_var.get() and bool(self.webhook_url_var.get().strip())
+        checks = [
+            f"Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+            f"vgamepad import: {'OK' if vg is not None else f'FAIL ({vg_import_error})'}",
+            f"Gamepad session: {'READY' if self.gamepad is not None else 'NOT INITIALIZED'}",
+            f"Roblox windows detected: {len(windows)}",
+            f"Biome log source: {latest_log}",
+            f"Current biome: {self.current_biome_name} ({self.current_biome_source})",
+            f"Webhook configured: {'YES' if webhook_on else 'NO'}",
+            f"Rare biome alerts: {'ON' if self.biome_alerts_enabled_var.get() else 'OFF'} ({self.rare_biome_var.get().strip().upper() or 'GLITCHED'})",
+            f"Session errors: {self.session_errors}",
+        ]
+        body = "\n".join(checks)
+        self.diagnostics_text.configure(state=tk.NORMAL)
+        self.diagnostics_text.delete("1.0", tk.END)
+        self.diagnostics_text.insert(tk.END, body)
+        self.diagnostics_text.configure(state=tk.DISABLED)
+        self.log("Diagnostics checks completed.")
+
+    def export_debug_bundle(self) -> None:
+        stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        default_name = f"afkscope-debug-{stamp}.zip"
+        path = filedialog.asksaveasfilename(
+            defaultextension=".zip",
+            initialfile=default_name,
+            filetypes=[("Zip archive", "*.zip")],
+        )
+        if not path:
+            return
+
+        self.run_diagnostics_checks()
+        diagnostics_body = self.diagnostics_text.get("1.0", tk.END).strip()
+        app_log_tail = self.log_box.get("1.0", tk.END).splitlines()[-250:]
+        biome_history = self.biome_history[-120:]
+
+        try:
+            with zipfile.ZipFile(path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+                zf.writestr("diagnostics.txt", diagnostics_body + "\n")
+                zf.writestr("afkscope-log-tail.txt", "\n".join(app_log_tail) + "\n")
+                zf.writestr("biome-history.txt", "\n".join(biome_history) + "\n")
+                if os.path.exists(self.config_path):
+                    zf.write(self.config_path, arcname="afkscope_config.json")
+                latest_log = self._find_latest_biome_log()
+                if latest_log and os.path.exists(latest_log):
+                    try:
+                        with open(latest_log, "r", encoding="utf-8", errors="ignore") as handle:
+                            lines = handle.readlines()[-600:]
+                        zf.writestr("latest-roblox-log-tail.txt", "".join(lines))
+                    except OSError:
+                        pass
+            self.log(f"Debug bundle exported: {path}")
+        except Exception as exc:
+            messagebox.showerror("Export debug bundle failed", str(exc))
+
+    def save_config(self) -> None:
+        data = self._collect_config_data()
         try:
             with open(self.config_path, "w", encoding="utf-8") as f:
                 json.dump(data, f, indent=2)
@@ -1478,34 +1722,9 @@ class AntiAfkApp:
         try:
             with open(self.config_path, "r", encoding="utf-8") as f:
                 data = json.load(f)
-
-            interval = str(data.get("interval_seconds", "5"))
-            auto_realign = bool(data.get("auto_realign", False))
-            raw_enabled = data.get("enabled_by_pid", {})
-            enabled_by_pid: dict[int, bool] = {}
-            if isinstance(raw_enabled, dict):
-                for k, v in raw_enabled.items():
-                    try:
-                        enabled_by_pid[int(k)] = bool(v)
-                    except (TypeError, ValueError):
-                        continue
-
-            self.interval_var.set(interval)
-            self.auto_realign_var.set(auto_realign)
-            self.loaded_enabled_by_pid = enabled_by_pid
-            self.jump_mode_var.set(str(data.get("jump_mode", "all")))
-            self.pause_enabled_var.set(bool(data.get("pause_enabled", False)))
-            self.pause_start_var.set(str(data.get("pause_start", "02:00")))
-            self.pause_end_var.set(str(data.get("pause_end", "06:00")))
-            self.webhook_enabled_var.set(bool(data.get("webhook_enabled", False)))
-            self.webhook_url_var.set(str(data.get("webhook_url", "")))
-            self.watchdog_enabled_var.set(bool(data.get("watchdog_enabled", True)))
-            self.watchdog_threshold_var.set(str(data.get("watchdog_threshold", "12")))
-            self.dark_mode_var.set(bool(data.get("dark_mode", False)))
-            self.current_theme_t = 1.0 if self.dark_mode_var.get() else 0.0
-            self._update_theme_toggle_icon()
-            self._apply_theme(self._theme_at(self.current_theme_t))
-            self.refresh_instance_list(manual=False)
+            if not isinstance(data, dict):
+                raise ValueError("Config file is invalid.")
+            self._apply_config_data(data)
             self.log(f"Config loaded: {self.config_path}")
         except Exception as exc:
             if not silent:
@@ -1645,3 +1864,5 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
+
