@@ -1,23 +1,23 @@
-﻿<p align="center">
-  <img src="AFKSCOPE%20ICON.png" alt="AFKScope Icon" width="96" />
+<p align="center">
+  <img src="STAYACTIVE%20ICON.png" alt="StayActive Icon" width="96" />
 </p>
 
-<h1 align="center">AFKScope</h1>
+<h1 align="center">StayActive</h1>
 
 <p align="center">
   Multi-instance Sol's RNG anti-AFK tool for Windows with focus spoofing, identity mapping, biome tracking, and robust diagnostics.
 </p>
 
 <p align="center">
-  <a href="https://github.com/0bl1terate3/AFKScope/releases/latest"><img src="https://img.shields.io/github/v/release/0bl1terate3/AFKScope?style=for-the-badge&label=release" alt="release"></a>
-  <a href="https://github.com/0bl1terate3/AFKScope/releases"><img src="https://img.shields.io/github/downloads/0bl1terate3/AFKScope/total?style=for-the-badge&label=downloads" alt="downloads"></a>
-  <a href="https://github.com/0bl1terate3/AFKScope/releases/latest"><img src="https://img.shields.io/github/downloads/0bl1terate3/AFKScope/latest/total?style=for-the-badge&label=latest%20downloads" alt="latest downloads"></a>
-  <a href="https://github.com/0bl1terate3/AFKScope/stargazers"><img src="https://img.shields.io/github/stars/0bl1terate3/AFKScope?style=for-the-badge" alt="stars"></a>
-  <a href="https://github.com/0bl1terate3/AFKScope/issues"><img src="https://img.shields.io/github/issues/0bl1terate3/AFKScope?style=for-the-badge" alt="issues"></a>
+  <a href="https://github.com/0bl1terate3/StayActive/releases/latest"><img src="https://img.shields.io/github/v/release/0bl1terate3/StayActive?style=for-the-badge&label=release" alt="release"></a>
+  <a href="https://github.com/0bl1terate3/StayActive/releases"><img src="https://img.shields.io/github/downloads/0bl1terate3/StayActive/total?style=for-the-badge&label=downloads" alt="downloads"></a>
+  <a href="https://github.com/0bl1terate3/StayActive/releases/latest"><img src="https://img.shields.io/github/downloads/0bl1terate3/StayActive/latest/total?style=for-the-badge&label=latest%20downloads" alt="latest downloads"></a>
+  <a href="https://github.com/0bl1terate3/StayActive/stargazers"><img src="https://img.shields.io/github/stars/0bl1terate3/StayActive?style=for-the-badge" alt="stars"></a>
+  <a href="https://github.com/0bl1terate3/StayActive/issues"><img src="https://img.shields.io/github/issues/0bl1terate3/StayActive?style=for-the-badge" alt="issues"></a>
 </p>
 
 <p align="center">
-  <a href="https://github.com/0bl1terate3/AFKScope/releases/latest"><b>Download Latest EXE</b></a>
+  <a href="https://github.com/0bl1terate3/StayActive/releases/latest"><b>Download Latest EXE</b></a>
   |
   <a href="https://discord.gg/MSVrKb5B9N"><b>Support Discord</b></a>
   |
@@ -33,13 +33,13 @@
   <img src="https://img.shields.io/badge/UI-Tkinter-4B8BBE?style=flat-square" alt="ui" />
 </p>
 
-![AFKScope UI](assets/afkscope-ui-v3.png)
+![StayActive UI](assets/stayactive-ui-v0.1.png)
 
 <table>
   <tr>
     <td>
       <b>What this is</b><br/>
-      AFKScope is a multi-instance Roblox anti-AFK desktop tool focused on reliability, visibility, and control.
+      StayActive is a multi-instance Roblox anti-AFK desktop tool focused on reliability, visibility, and control.
     </td>
     <td>
       <b>What you get</b><br/>
@@ -50,7 +50,7 @@
 
 ---
 
-## Why AFKScope
+## Why StayActive
 
 - Handles multiple Roblox instances with per-instance control.
 - Sends anti-AFK jumps with focus spoofing (`All-at-once` and `Round-robin`).
@@ -124,10 +124,10 @@ pip install pystray pillow
 - In-app update checks + release page shortcut.
 - Config/preset validation improvements (pause schedule + webhook URL checks).
 - Config save/load, portable bundle import/export, JSON/CSV export, and debug bundle export.
-- Dedicated AFKScope header logo for clearer branding/readability.
+- Dedicated StayActive header logo for clearer branding/readability.
 - Event timeline panel and copy-to-clipboard diagnostics utilities.
 
-## Patch Notes (v0.2.8)
+## Patch Notes (v0.1)
 
 - Added first-launch Quick Setup Wizard.
 - Added global hotkeys (`Ctrl+Alt+S/J/R/T`) for common actions.
@@ -136,14 +136,14 @@ pip install pystray pillow
 - Added auto-save recovery snapshots plus restore prompt after unclean shutdown.
 - Added one-click clipboard support bundle for diagnostics + recent events/logs.
 
-## Patch Notes (v0.2.7)
+## Previous Notes
 
 - Added Theme Maker (create, preview, save, and delete custom color themes).
-- Added custom theme persistence in `afkscope_themes.json`.
+- Added custom theme persistence in `stayactive_themes.json`.
 - Added dedicated header logo asset for improved header clarity.
 - Included custom themes in portable export/import and debug bundle exports.
 - Added official support Discord link: `https://discord.gg/MSVrKb5B9N`.
-- Added AFKScope wiki-ready page content (`afkscopepage.md`) and macro list update (`macros.md`).
+- Added StayActive wiki-ready page content and macro list update (`macros.md`).
 
 ## Build EXE
 
@@ -151,26 +151,26 @@ Fast path (recommended):
 
 ```powershell
 py -3.10 -m pip install --upgrade pyinstaller vgamepad pystray pillow
-py -3.10 -m PyInstaller --noconfirm --onefile --windowed --name AFKScope --icon "AFKSCOPE ICON.ico" --add-data "AFKSCOPE ICON.ico;." --add-data "assets/afkscope-header-logo.png;assets" --collect-binaries vgamepad --collect-data vgamepad --collect-submodules vgamepad main.py
+py -3.10 -m PyInstaller --noconfirm --onefile --windowed --name StayActive --icon "STAYACTIVE ICON.ico" --add-data "STAYACTIVE ICON.ico;." --add-data "assets/stayactive-header-logo.png;assets" --collect-binaries vgamepad --collect-data vgamepad --collect-submodules vgamepad main.py
 ```
 
 Standard path:
 
 ```powershell
-python -m PyInstaller --noconfirm --onefile --windowed --name AFKScope --icon "AFKSCOPE ICON.ico" --add-data "AFKSCOPE ICON.ico;." --add-data "assets/afkscope-header-logo.png;assets" --collect-binaries vgamepad --collect-data vgamepad --collect-submodules vgamepad main.py
+python -m PyInstaller --noconfirm --onefile --windowed --name StayActive --icon "STAYACTIVE ICON.ico" --add-data "STAYACTIVE ICON.ico;." --add-data "assets/stayactive-header-logo.png;assets" --collect-binaries vgamepad --collect-data vgamepad --collect-submodules vgamepad main.py
 ```
 
-Output: `dist/AFKScope.exe`
+Output: `dist/StayActive.exe`
 
 ## Troubleshooting
 
 - If the app process exists but no window appears:
   Ensure ViGEmBus is installed and running.
-  Use the latest release build (`v0.2.8+`) which includes startup/import fixes and QoL diagnostics improvements.
+  Use the latest release build (`v0.1+`) which includes startup/import fixes and QoL diagnostics improvements.
 - If PyInstaller hangs on Python 3.14:
   Build with Python 3.10 (`py -3.10`) as shown above.
 
 ## Safety
 
-Use AFKScope responsibly and at your own risk. You are responsible for compliance with game/platform rules and account safety.
+Use StayActive responsibly and at your own risk. You are responsible for compliance with game/platform rules and account safety.
 
