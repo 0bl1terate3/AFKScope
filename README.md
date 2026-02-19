@@ -23,6 +23,8 @@
   |
   <a href="#quick-start"><b>Quick Start</b></a>
   |
+  <a href="FIXLOG.md"><b>Fix Log</b></a>
+  |
   <a href="#build-exe"><b>Build From Source</b></a>
 </p>
 
@@ -134,6 +136,19 @@ pip install pystray pillow
 - Dedicated StayActive header logo for clearer branding/readability.
 - Event timeline panel and copy-to-clipboard diagnostics utilities.
 
+## Patch Notes (v0.1.6)
+
+- Rolls up the post-`v0.1.5` hotfix train into a stable bundled release.
+- Fixed multi-instance identity resolution conflicts and reduced race conditions in identity refresh passes.
+- Improved conflict handling so duplicate username/userId mappings are flagged as `conflict` and retried cleanly.
+- Hardened crash-reporting thread safety by avoiding direct Tk widget reads from background threads.
+- Hardened identity worker exception handling to prevent lookup failures from destabilizing the UI flow.
+- Added hotkey safety lock behavior to block `Start/Stop` and `To Tray` hotkeys while Roblox is focused (when enabled).
+- Stabilized singleton cleanup by bounding per-PID cleanup retries.
+- Added watchdog auto-relaunch controls for dropped instances (grace window + hourly cap).
+
+For granular entries captured during hotfixing, see `FIXLOG.md`.
+
 ## Patch Notes (v0.1.5)
 
 - Added a new **Performance** tab with a full Roblox process limiter.
@@ -153,6 +168,8 @@ pip install pystray pillow
 - Added thread-safety improvements for UI logging/event updates and bounded in-app log retention.
 - Added portable import integrity checks (checksum validation from metadata when present).
 - Updated PyInstaller spec output metadata to `StayActive` naming and admin manifest settings.
+
+For targeted hotfix details after release, see `FIXLOG.md`.
 
 ## Previous Notes (v0.1.4)
 
@@ -184,6 +201,17 @@ python -m PyInstaller --noconfirm --clean --onefile --windowed --uac-admin --nam
 ```
 
 Output: `dist/StayActive.exe`
+
+## Release (maintainer flow)
+
+After building and validating `dist/StayActive.exe`, publish the release from repo root:
+
+```powershell
+git tag v0.1.6
+git push origin main
+git push origin v0.1.6
+gh release create v0.1.6 dist/StayActive.exe --title "StayActive v0.1.6" --notes-file FIXLOG.md
+```
 
 ## Troubleshooting
 
