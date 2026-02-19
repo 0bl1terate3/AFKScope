@@ -1,29 +1,16 @@
 # StayActive v0.1.7
 
-This update is all about making StayActive easier to run and easier to trust.
+## Simple summary
 
-## What’s new (simple version)
+You can now set up simple in-app rules, so StayActive can react automatically instead of needing as much manual clicking.
 
-- **Now, you can automate more stuff without babysitting the app.**
-  - You can turn on Rules mode and have StayActive react to events automatically.
-  - You can see recent rule activity right in the app.
+You can now see a clearer Identity Reliability panel, so it is easier to understand why an account match worked, failed, or needs a retry.
 
-- **Now, you can understand identity issues faster.**
-  - You can see why an instance is low confidence or in conflict.
-  - You can retry identity, clear identity cache, and pin/unpin identity for the current session.
+You can now pin identity mapping for the current session, so selected instances stay stable while you run, without saving risky permanent pins.
 
-- **Now, you can choose how aggressive auto-relaunch should be.**
-  - You can pick `conservative`, `balanced`, or `aggressive` playbooks.
-  - You can also see the latest relaunch reason so it’s clear why the app did (or didn’t) relaunch.
+You can now choose relaunch playbooks (conservative, balanced, or aggressive), so recovery behavior matches how safe or fast you want it.
 
-- **Now, you can troubleshoot faster when something goes wrong.**
-  - Support/diagnostic exports include more useful identity and relaunch details.
+You can now see plain relaunch reasons, so it is easier to tell why StayActive relaunched, waited, or hit cooldown/cap limits.
 
-## Small quality update
-
-- The webhook test popup behavior was updated on the requested path.
-
-## Included download
-
-- `StayActive.exe` (Windows)
+Diagnostics are easier to use now, with better identity and relaunch details included for troubleshooting.
 
