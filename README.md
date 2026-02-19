@@ -135,6 +135,79 @@ pip install pystray pillow
 - Config save/load, portable bundle import/export, JSON/CSV export, and debug bundle export.
 - Dedicated StayActive header logo for clearer branding/readability.
 - Event timeline panel and copy-to-clipboard diagnostics utilities.
+- Rules MVP (Phase 1): in-process trigger/condition/action automation with cooldown/debounce and compact runtime status.
+- Identity Reliability Center (Phase 2 MVP): per-instance confidence reasons, conflict/retry telemetry, quick retry/clear actions, and session-only PID→identity pinning.
+- Relaunch Playbooks + tracing (Phase 3 MVP): Conservative/Balanced/Aggressive presets, cooldown pacing, and explainable relaunch decision reasons exported in diagnostics/support bundles.
+
+## Rules MVP (Phase 1)
+
+Rules mode adds a lightweight in-process automation layer driven by normalized app events.
+
+- Event normalization shape:
+  - `type` (event identifier)
+  - `category` (domain bucket)
+  - `severity` (`debug|info|warning|error|critical`)
+  - `timestamp` (UTC ISO-8601)
+  - `source` (emitter identity)
+  - `payload` (event-specific data)
+- Rules engine capabilities:
+  - Trigger matching (`type/category/severity/source`, optional `type_prefix`, optional message `contains`)
+  - Optional condition checks (`runtime_running`, payload-key checks with `equals`/`not_equals`/`in`, optional `contains`)
+  - Actions (MVP):
+    - `send_webhook`
+    - `load_preset`
+    - `pause` / `pause_for_minutes`
+    - `resume` / `clear_pause`
+  - Cooldown and debounce controls per rule (`cooldown_seconds`, `debounce_seconds`)
+
+### Usage
+
+- Open **Dashboard → Automation → Rules (MVP)**.
+- Enable **Rules mode** to activate evaluation.
+- Optionally enable **Verbose rule logs** for skip reasons (cooldown/debounce).
+- Rules definitions are persisted in config under `rules_definitions` and validated on load.
+
+### Constraints
+
+- Rules are **default-off** and do not alter behavior until enabled.
+- Rules run in-process and are intentionally minimal for stability.
+- Invalid rule entries are ignored during load normalization.
+- The current MVP is schema-light by design; future phases may add a richer editor/schema.
+
+## Identity Reliability Center (Phase 2 MVP)
+
+- Added a compact **Instances → Identity Reliability Center (MVP)** panel that shows:
+  - selected PID confidence label + confidence reason
+  - conflict count and latest conflict reason
+  - retry count and latest retry timing
+  - session pin state
+- Added quick actions for selected rows:
+  - **Retry Identity**
+  - **Clear Identity Cache**
+  - **Pin Session** / **Unpin Session**
+- Session pins are in-memory only (not persisted to config) and are auto-invalidated when the PID exits.
+
+## Relaunch Playbooks + Decision Tracing (Phase 3 MVP)
+
+- Added relaunch strategy presets mapped to existing controls:
+  - `conservative` → higher grace, lower launch cap, longer cooldown pacing
+  - `balanced` → default behavior
+  - `aggressive` → shorter grace, higher launch cap, shorter cooldown pacing
+- Added **Relaunch cooldown (s)** as an explicit pacing control used by playbooks and custom mode.
+- Added decision tracing for relaunch state transitions (`no-op`, `cooldown`, `launch`, `cap`).
+- Latest relaunch reason is surfaced in UI and included in diagnostics/support artifacts.
+- Debug/support exports now include structured relaunch trace + identity telemetry snapshots.
+
+## Patch Notes (v0.1.7)
+
+- Added **Rules MVP (Phase 1)** with normalized internal event envelopes (`type/category/severity/source/timestamp/payload`) and in-process trigger → condition → action execution.
+- Added Rules safeguards and operator controls: enable/disable toggle, verbose rule logging, cooldown/debounce handling, compact status panel, and recent rule execution visibility.
+- Added **Identity Reliability Center (Phase 2 MVP)** for selected instances with confidence reasons, conflict/retry telemetry, and quick actions (retry, clear cache, session pin/unpin).
+- Added session-only identity pinning safeguards (PID-scoped, auto-invalidated on process exit, intentionally not persisted across restart).
+- Added **Relaunch Playbooks (Phase 3 MVP)** (`conservative`, `balanced`, `aggressive`) plus explicit relaunch cooldown pacing.
+- Added explainable relaunch decision tracing (`no-op`, `cooldown`, `launch`, `cap`) surfaced in UI and exported in diagnostics/support artifacts.
+- Expanded diagnostics/support exports with identity telemetry and relaunch trace snapshots for faster troubleshooting.
+- Updated webhook test popup behavior on this path to use an error-style dialog as requested.
 
 ## Patch Notes (v0.1.6)
 
@@ -207,10 +280,10 @@ Output: `dist/StayActive.exe`
 After building and validating `dist/StayActive.exe`, publish the release from repo root:
 
 ```powershell
-git tag v0.1.6
+git tag v0.1.7
 git push origin main
-git push origin v0.1.6
-gh release create v0.1.6 dist/StayActive.exe --title "StayActive v0.1.6" --notes-file FIXLOG.md
+git push origin v0.1.7
+gh release create v0.1.7 dist/StayActive.exe --title "StayActive v0.1.7" --notes-file RELEASE_NOTES_v0.1.7.md
 ```
 
 ## Troubleshooting

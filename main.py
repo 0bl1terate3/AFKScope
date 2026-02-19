@@ -106,8 +106,14 @@ BIOME_ALIAS_MAP: dict[str, str] = {
     "aurora": "AURORA",
 }
 
-APP_VERSION = "0.1.6"
-APP_CONFIG_VERSION = 1
+RELAUNCH_PLAYBOOKS: dict[str, dict[str, float | int]] = {
+    "conservative": {"grace_seconds": 75, "max_per_hour": 4, "cooldown_seconds": 35},
+    "balanced": {"grace_seconds": 45, "max_per_hour": 8, "cooldown_seconds": 20},
+    "aggressive": {"grace_seconds": 20, "max_per_hour": 20, "cooldown_seconds": 10},
+}
+
+APP_VERSION = "0.1.7"
+APP_CONFIG_VERSION = 3
 APP_NAME = "StayActive"
 APP_USER_AGENT = f"{APP_NAME}/{APP_VERSION}"
 APP_ICON_ICO = "STAYACTIVE ICON.ico"
@@ -267,7 +273,7 @@ class AntiAfkApp:
         self.stop_event = threading.Event()
         self.metrics_lock = threading.Lock()
         self.state_lock = threading.RLock()
-        self.ui_dispatch_queue: queue.Queue[tuple[Callable[..., None], tuple[Any, ...]]] = queue.Queue()
+        self.ui_dispatch_queue: queue.Queue[tuple[Callable[..., Any], tuple[Any, ...]]] = queue.Queue()
         self.header_logo_photo: tk.PhotoImage | None = None
         self.header_logo_label: tk.Label | None = None
         self.header_icon_photo: Any | None = None
@@ -324,6 +330,10 @@ class AntiAfkApp:
         self.startup_auto_start_var = tk.BooleanVar(value=False)
         self.startup_auto_align_var = tk.BooleanVar(value=False)
         self.event_filter_var = tk.StringVar(value="all")
+        self.rules_mode_enabled_var = tk.BooleanVar(value=False)
+        self.rules_verbose_logging_var = tk.BooleanVar(value=False)
+        self.rules_status_var = tk.StringVar(value="Rules: OFF")
+        self.rules_last_match_var = tk.StringVar(value="Last rule: -")
         self.scheduler_enabled_var = tk.BooleanVar(value=False)
         self.scheduler_slot1_time_var = tk.StringVar(value="08:00")
         self.scheduler_slot1_preset_var = tk.StringVar(value="day")
@@ -340,8 +350,11 @@ class AntiAfkApp:
         self.instance_relaunch_enabled_var = tk.BooleanVar(value=False)
         self.instance_relaunch_grace_seconds_var = tk.StringVar(value="45")
         self.instance_relaunch_max_per_hour_var = tk.StringVar(value="8")
+        self.instance_relaunch_cooldown_seconds_var = tk.StringVar(value="20")
+        self.instance_relaunch_playbook_var = tk.StringVar(value="custom")
         self.instance_relaunch_launch_target_var = tk.StringVar(value="")
         self.instance_relaunch_status_var = tk.StringVar(value="Relaunch idle.")
+        self.instance_relaunch_decision_reason_var = tk.StringVar(value="Reason: -")
         self.account_roster_enabled_var = tk.BooleanVar(value=False)
         self.account_roster_status_var = tk.StringVar(value="Roster OFF (0 locked)")
         self.watchdog_standby_mode_var = tk.BooleanVar(value=False)
@@ -379,9 +392,12 @@ class AntiAfkApp:
         self.runtime_instance_relaunch_enabled = False
         self.runtime_instance_relaunch_grace_seconds = 45
         self.runtime_instance_relaunch_max_per_hour = 8
+        self.runtime_instance_relaunch_cooldown_seconds = 20.0
+        self.runtime_instance_relaunch_playbook = "custom"
         self.runtime_instance_relaunch_launch_target = ""
         self.runtime_account_roster_enabled = False
         self.runtime_watchdog_standby_mode = False
+        self.runtime_rules_mode_enabled = False
 
         self.watchdog_enabled_var = tk.BooleanVar(value=True)
         self.watchdog_threshold_var = tk.StringVar(value="12")
@@ -438,6 +454,9 @@ class AntiAfkApp:
         self.instance_relaunch_launcher_cache_path = ""
         self.instance_relaunch_launcher_cache_at = 0.0
         self.instance_relaunch_last_log_at = 0.0
+        self.instance_relaunch_decision_trace: list[dict[str, Any]] = []
+        self.instance_relaunch_last_trace_signature = ""
+        self.instance_relaunch_last_trace_at = 0.0
         self.account_roster_user_ids: set[int] = set()
         self.account_roster_names_by_user_id: dict[int, str] = {}
         self.account_roster_missing_since_by_user_id: dict[int, float] = {}
@@ -461,9 +480,17 @@ class AntiAfkApp:
         self.pid_create_time_cache: dict[int, float] = {}
         self.pid_avatar_photo: dict[int, tk.PhotoImage] = {}
         self.pid_identity_confidence: dict[int, str] = {}
+        self.pid_identity_reason: dict[int, str] = {}
+        self.pid_identity_conflict_count: dict[int, int] = {}
+        self.pid_identity_last_conflict_reason: dict[int, str] = {}
+        self.pid_identity_retry_count: dict[int, int] = {}
+        self.pid_identity_last_retry_at: dict[int, float] = {}
+        self.pid_identity_session_pins: dict[int, dict[str, Any]] = {}
         self.identity_lookup_inflight: set[int] = set()
         self.identity_last_attempt: dict[int, float] = {}
         self.identity_conflict_last_log_at = 0.0
+        self.identity_reliability_summary_var = tk.StringVar(value="Identity Reliability: no selection")
+        self.identity_reliability_detail_var = tk.StringVar(value="Select an instance row to inspect status/reason.")
         self.singleton_cleanup_last_attempt_by_pid: dict[int, float] = {}
         self.singleton_cleanup_attempt_count_by_pid: dict[int, int] = {}
         self.singleton_cleanup_attempt_interval_seconds = 20.0
@@ -598,6 +625,14 @@ class AntiAfkApp:
         self.biome_history: list[str] = []
         self.event_timeline: list[str] = []
         self.recovery_timeline: list[str] = []
+        self.normalized_event_log: list[dict[str, Any]] = []
+        self.max_normalized_events = 400
+        self.rules_definitions: list[dict[str, Any]] = []
+        self.rules_execution_log: list[str] = []
+        self.rules_last_trigger_at_by_id: dict[str, float] = {}
+        self.rules_last_match_at_by_id: dict[str, float] = {}
+        self.rules_total_matches = 0
+        self.rules_total_actions = 0
         self.biome_alert_cooldown_seconds = 45
         self.last_biome_alert_at: dict[str, float] = {}
         self.last_vendor_alert_at: dict[str, float] = {}
@@ -1063,7 +1098,27 @@ class AntiAfkApp:
             width=5,
             justify="center",
         ).pack(side=tk.LEFT)
+        ttk.Label(relaunch_row, text="Cooldown (s):").pack(side=tk.LEFT, padx=(10, 4))
+        ttk.Entry(
+            relaunch_row,
+            textvariable=self.instance_relaunch_cooldown_seconds_var,
+            width=5,
+            justify="center",
+        ).pack(side=tk.LEFT)
         ttk.Label(relaunch_row, textvariable=self.instance_relaunch_status_var).pack(side=tk.RIGHT)
+
+        relaunch_playbook_row = ttk.Frame(watchdog_group)
+        relaunch_playbook_row.pack(fill="x", pady=(6, 0))
+        ttk.Label(relaunch_playbook_row, text="Relaunch playbook:").pack(side=tk.LEFT)
+        ttk.Combobox(
+            relaunch_playbook_row,
+            textvariable=self.instance_relaunch_playbook_var,
+            values=["custom", "conservative", "balanced", "aggressive"],
+            width=14,
+            state="readonly",
+        ).pack(side=tk.LEFT, padx=(6, 8))
+        ttk.Button(relaunch_playbook_row, text="Apply Playbook", width=14, command=self.apply_relaunch_playbook).pack(side=tk.LEFT)
+        ttk.Label(relaunch_playbook_row, textvariable=self.instance_relaunch_decision_reason_var).pack(side=tk.RIGHT)
 
         relaunch_target_row = ttk.Frame(watchdog_group)
         relaunch_target_row.pack(fill="x", pady=(6, 0))
@@ -1114,6 +1169,26 @@ class AntiAfkApp:
         ttk.Entry(pause_quick_row, textvariable=self.manual_pause_minutes_var, width=5, justify="center").pack(side=tk.LEFT, padx=(8, 6))
         ttk.Button(pause_quick_row, text="Pause Now", width=10, command=self.pause_for_minutes).pack(side=tk.LEFT)
         ttk.Button(pause_quick_row, text="Resume", width=10, command=self.clear_manual_pause).pack(side=tk.LEFT, padx=(6, 0))
+
+        rules_group = ttk.LabelFrame(dash_automation, text="Rules (MVP)", padding=10)
+        rules_group.pack(fill="x", pady=(8, 0))
+        rules_top = ttk.Frame(rules_group)
+        rules_top.pack(fill="x")
+        ttk.Checkbutton(
+            rules_top,
+            text="Enable rules mode",
+            variable=self.rules_mode_enabled_var,
+            command=self._on_rules_mode_toggle,
+        ).pack(side=tk.LEFT)
+        ttk.Checkbutton(
+            rules_top,
+            text="Verbose rule logs",
+            variable=self.rules_verbose_logging_var,
+        ).pack(side=tk.LEFT, padx=(10, 0))
+        ttk.Label(rules_top, textvariable=self.rules_status_var).pack(side=tk.RIGHT)
+        ttk.Label(rules_group, textvariable=self.rules_last_match_var).pack(anchor="w", pady=(6, 0))
+        self.rules_history_list = tk.Listbox(rules_group, height=4)
+        self.rules_history_list.pack(fill="x", pady=(4, 0))
 
         webhook_group = ttk.LabelFrame(dash_alerts, text="Webhook Alerts", padding=10)
         webhook_group.pack(fill="x")
@@ -1300,7 +1375,7 @@ class AntiAfkApp:
         self.event_filter_combo = ttk.Combobox(
             timeline_actions,
             textvariable=self.event_filter_var,
-            values=["all", "errors", "watchdog", "biome", "vendor", "hotkeys", "health", "recovery", "scheduler", "updates"],
+            values=["all", "errors", "watchdog", "biome", "vendor", "hotkeys", "health", "recovery", "scheduler", "updates", "rules"],
             width=12,
             state="readonly",
         )
@@ -1382,10 +1457,22 @@ class AntiAfkApp:
         self.instance_tree.column("title", width=270, anchor="w")
         self.instance_tree.pack(side=tk.LEFT, fill="both", expand=True)
         self.instance_tree.bind("<Double-1>", self.on_tree_double_click)
+        self.instance_tree.bind("<<TreeviewSelect>>", self.on_instance_selection_changed)
 
         tree_scroll = ttk.Scrollbar(tree_frame, orient=tk.VERTICAL, command=self.instance_tree.yview)
         tree_scroll.pack(side=tk.RIGHT, fill="y")
         self.instance_tree.configure(yscrollcommand=tree_scroll.set)
+
+        identity_group = ttk.LabelFrame(tab_instances, text="Identity Reliability Center (MVP)", padding=8)
+        identity_group.pack(fill="x", pady=(8, 0))
+        ttk.Label(identity_group, textvariable=self.identity_reliability_summary_var).pack(anchor="w")
+        ttk.Label(identity_group, textvariable=self.identity_reliability_detail_var, wraplength=980, justify=tk.LEFT).pack(anchor="w", pady=(3, 0))
+        identity_actions = ttk.Frame(identity_group)
+        identity_actions.pack(fill="x", pady=(6, 0))
+        ttk.Button(identity_actions, text="Retry Identity", width=13, command=self.retry_selected_identity).pack(side=tk.LEFT, padx=(0, 4))
+        ttk.Button(identity_actions, text="Clear Identity Cache", width=16, command=self.clear_selected_identity_cache).pack(side=tk.LEFT, padx=(0, 4))
+        ttk.Button(identity_actions, text="Pin Session", width=11, command=self.pin_selected_identity_session).pack(side=tk.LEFT, padx=(0, 4))
+        ttk.Button(identity_actions, text="Unpin Session", width=11, command=self.unpin_selected_identity_session).pack(side=tk.LEFT)
 
         limiter_group = ttk.LabelFrame(tab_performance, text="Process Limiter", padding=10)
         limiter_group.pack(fill="x", pady=(0, 8))
@@ -1523,7 +1610,7 @@ class AntiAfkApp:
         self.log_box.see(tk.END)
         self.log_box.configure(state=tk.DISABLED)
 
-    def _enqueue_on_ui_thread(self, callback: Callable[..., None], *args: Any) -> bool:
+    def _enqueue_on_ui_thread(self, callback: Callable[..., Any], *args: Any) -> bool:
         if threading.current_thread() is threading.main_thread():
             return False
         try:
@@ -2388,18 +2475,320 @@ class AntiAfkApp:
             for item in self.biome_history[-40:]:
                 self.biome_history_list.insert(tk.END, item)
 
-    def _record_event(self, text: str) -> None:
-        if self._enqueue_on_ui_thread(self._record_event, text):
-            return
+    @staticmethod
+    def _event_category_from_text(text: str) -> str:
+        hay = text.strip().lower()
+        if not hay:
+            return "general"
+        if "error" in hay or "failed" in hay:
+            return "error"
+        if "watchdog" in hay or "recovery" in hay or "relaunch" in hay or "quarantine" in hay:
+            return "recovery"
+        if "biome" in hay:
+            return "biome"
+        if "vendor" in hay or "merchant" in hay or "jester" in hay:
+            return "vendor"
+        if "hotkey" in hay:
+            return "hotkeys"
+        if "health" in hay:
+            return "health"
+        if "scheduler" in hay:
+            return "scheduler"
+        if "update" in hay or "release" in hay:
+            return "updates"
+        if "rule" in hay:
+            return "rules"
+        return "general"
+
+    @staticmethod
+    def _event_severity_from_text(text: str) -> str:
+        hay = text.strip().lower()
+        if "error" in hay or "failed" in hay:
+            return "error"
+        if "warning" in hay or "warn" in hay:
+            return "warning"
+        return "info"
+
+    def _normalize_event(
+        self,
+        event_type: str,
+        category: str,
+        severity: str,
+        source: str,
+        payload: dict[str, Any],
+    ) -> dict[str, Any]:
+        normalized_type = event_type.strip().lower() or "app.event"
+        normalized_category = category.strip().lower() or "general"
+        normalized_severity = severity.strip().lower()
+        if normalized_severity not in {"debug", "info", "warning", "error", "critical"}:
+            normalized_severity = "info"
+        normalized_source = source.strip().lower() or "app"
+        safe_payload = dict(payload) if isinstance(payload, dict) else {"value": payload}
+        return {
+            "type": normalized_type,
+            "category": normalized_category,
+            "severity": normalized_severity,
+            "timestamp": datetime.now(timezone.utc).isoformat(timespec="milliseconds"),
+            "source": normalized_source,
+            "payload": safe_payload,
+        }
+
+    def _append_rules_execution_log(self, line: str) -> None:
         stamp = time.strftime("%H:%M:%S")
-        line = f"{stamp} | {text}"
+        entry = f"{stamp} | {line}"
+        self.rules_execution_log.append(entry)
+        self.rules_execution_log = self.rules_execution_log[-80:]
+        if hasattr(self, "rules_history_list"):
+            self.rules_history_list.delete(0, tk.END)
+            for item in self.rules_execution_log[-20:]:
+                self.rules_history_list.insert(tk.END, item)
+
+    def _refresh_rules_status(self) -> None:
+        state = "ON" if self.runtime_rules_mode_enabled else "OFF"
+        self.rules_status_var.set(
+            f"Rules: {state} | defs {len(self.rules_definitions)} | matches {self.rules_total_matches} | actions {self.rules_total_actions}"
+        )
+
+    def _on_rules_mode_toggle(self) -> None:
+        self._sync_runtime_settings_from_ui()
+        self._refresh_rules_status()
+        self._record_event(f"Rules mode {'enabled' if self.runtime_rules_mode_enabled else 'disabled'}")
+
+    @staticmethod
+    def _extract_payload_value(payload: dict[str, Any], key_path: str) -> Any:
+        current: Any = payload
+        for part in key_path.split("."):
+            if not isinstance(current, dict) or part not in current:
+                return None
+            current = current.get(part)
+        return current
+
+    def _rule_value_match(self, expected: Any, actual: Any) -> bool:
+        if isinstance(expected, list):
+            return any(self._rule_value_match(item, actual) for item in expected)
+        if isinstance(expected, str):
+            return str(actual).strip().lower() == expected.strip().lower()
+        return expected == actual
+
+    def _rule_trigger_matches(self, trigger: dict[str, Any], event: dict[str, Any]) -> bool:
+        if not trigger:
+            return False
+        for key in ("type", "category", "severity", "source"):
+            expected = trigger.get(key)
+            if expected is None:
+                continue
+            if not self._rule_value_match(expected, event.get(key)):
+                return False
+        prefix = trigger.get("type_prefix")
+        if isinstance(prefix, str) and prefix.strip():
+            event_type = str(event.get("type", ""))
+            if not event_type.startswith(prefix.strip().lower()):
+                return False
+        contains = str(trigger.get("contains", "")).strip().lower()
+        if contains:
+            message = str(event.get("payload", {}).get("message", "")).lower()
+            if contains not in message:
+                return False
+        return True
+
+    def _rule_conditions_pass(self, condition: dict[str, Any], event: dict[str, Any]) -> bool:
+        if not condition:
+            return True
+        payload = event.get("payload", {})
+        if not isinstance(payload, dict):
+            payload = {}
+        runtime_running = condition.get("runtime_running")
+        if runtime_running is not None and bool(runtime_running) != bool(self.is_running):
+            return False
+        key_path = condition.get("payload_key")
+        if isinstance(key_path, str) and key_path.strip():
+            value = self._extract_payload_value(payload, key_path.strip())
+            if "equals" in condition and not self._rule_value_match(condition.get("equals"), value):
+                return False
+            if "not_equals" in condition and self._rule_value_match(condition.get("not_equals"), value):
+                return False
+            if "in" in condition:
+                options = condition.get("in")
+                if not isinstance(options, list):
+                    return False
+                if not any(self._rule_value_match(option, value) for option in options):
+                    return False
+        contains = str(condition.get("contains", "")).strip().lower()
+        if contains:
+            message = str(payload.get("message", "")).lower()
+            if contains not in message:
+                return False
+        return True
+
+    def _dispatch_rule_action(self, rule_id: str, action: dict[str, Any], event: dict[str, Any]) -> bool:
+        action_type = str(action.get("type", "")).strip().lower()
+        payload = event.get("payload", {})
+        if not isinstance(payload, dict):
+            payload = {}
+        if action_type == "send_webhook":
+            title = str(action.get("title", f"{APP_NAME} Rule")).strip()
+            description = str(action.get("description", payload.get("message", "Rule matched."))).strip()
+            channel = str(action.get("channel", "default")).strip().lower() or "default"
+            self._send_webhook(title, description, channel=channel)
+            return True
+        if action_type == "load_preset":
+            preset = self._sanitize_preset_name(str(action.get("preset", "default")))
+            self.preset_name_var.set(preset)
+            self.load_preset()
+            return True
+        if action_type in {"pause", "pause_for_minutes"}:
+            try:
+                minutes = int(action.get("minutes", 5))
+            except (TypeError, ValueError):
+                minutes = 5
+            minutes = max(1, min(120, minutes))
+            self.pause_override_until = time.time() + (minutes * 60)
+            self.log(f"Rule '{rule_id}' applied manual pause for {minutes} minute(s).")
+            return True
+        if action_type in {"resume", "clear_pause"}:
+            self.clear_manual_pause()
+            return True
+        return False
+
+    def _validate_rule_definition(self, raw_rule: Any) -> dict[str, Any] | None:
+        if not isinstance(raw_rule, dict):
+            return None
+        rule_id = str(raw_rule.get("id", "")).strip() or f"rule_{len(self.rules_definitions) + 1}"
+        trigger = raw_rule.get("trigger")
+        if not isinstance(trigger, dict):
+            return None
+        condition = raw_rule.get("condition", {})
+        if condition is None:
+            condition = {}
+        if not isinstance(condition, dict):
+            return None
+        raw_actions = raw_rule.get("actions", raw_rule.get("action", []))
+        actions: list[dict[str, Any]] = []
+        if isinstance(raw_actions, dict):
+            actions = [raw_actions]
+        elif isinstance(raw_actions, list):
+            actions = [item for item in raw_actions if isinstance(item, dict)]
+        if not actions:
+            return None
+        try:
+            cooldown_seconds = max(0.0, float(raw_rule.get("cooldown_seconds", 0)))
+        except (TypeError, ValueError):
+            cooldown_seconds = 0.0
+        try:
+            debounce_seconds = max(0.0, float(raw_rule.get("debounce_seconds", 0)))
+        except (TypeError, ValueError):
+            debounce_seconds = 0.0
+        return {
+            "id": rule_id,
+            "enabled": bool(raw_rule.get("enabled", True)),
+            "trigger": trigger,
+            "condition": condition,
+            "actions": actions,
+            "cooldown_seconds": cooldown_seconds,
+            "debounce_seconds": debounce_seconds,
+        }
+
+    def _normalize_rules_definitions(self, raw_rules: Any) -> list[dict[str, Any]]:
+        if not isinstance(raw_rules, list):
+            return []
+        normalized: list[dict[str, Any]] = []
+        for entry in raw_rules:
+            valid = self._validate_rule_definition(entry)
+            if valid is not None:
+                normalized.append(valid)
+        return normalized
+
+    def _evaluate_rules_for_event(self, event: dict[str, Any]) -> None:
+        if not self.runtime_rules_mode_enabled:
+            return
+        if event.get("source") == "rules-engine":
+            return
+        now = time.time()
+        for rule in self.rules_definitions:
+            if not rule.get("enabled", True):
+                continue
+            rule_id = str(rule.get("id", "rule"))
+            trigger = rule.get("trigger", {})
+            condition = rule.get("condition", {})
+            actions = rule.get("actions", [])
+            if not isinstance(trigger, dict) or not isinstance(condition, dict) or not isinstance(actions, list):
+                continue
+            if not self._rule_trigger_matches(trigger, event):
+                continue
+            if not self._rule_conditions_pass(condition, event):
+                continue
+            last_match = self.rules_last_match_at_by_id.get(rule_id, 0.0)
+            debounce_seconds = float(rule.get("debounce_seconds", 0.0) or 0.0)
+            if debounce_seconds > 0 and (now - last_match) < debounce_seconds:
+                if self.rules_verbose_logging_var.get():
+                    self._append_rules_execution_log(f"{rule_id} skipped (debounce {debounce_seconds:.1f}s)")
+                continue
+            last_trigger = self.rules_last_trigger_at_by_id.get(rule_id, 0.0)
+            cooldown_seconds = float(rule.get("cooldown_seconds", 0.0) or 0.0)
+            if cooldown_seconds > 0 and (now - last_trigger) < cooldown_seconds:
+                if self.rules_verbose_logging_var.get():
+                    self._append_rules_execution_log(f"{rule_id} skipped (cooldown {cooldown_seconds:.1f}s)")
+                continue
+            self.rules_last_match_at_by_id[rule_id] = now
+            self.rules_last_trigger_at_by_id[rule_id] = now
+            self.rules_total_matches += 1
+            action_count = 0
+            for action in actions:
+                if not isinstance(action, dict):
+                    continue
+                if self._dispatch_rule_action(rule_id, action, event):
+                    action_count += 1
+                    self.rules_total_actions += 1
+            self.rules_last_match_var.set(f"Last rule: {rule_id} ({action_count} action(s))")
+            self._append_rules_execution_log(f"{rule_id} matched | actions={action_count}")
+            self._refresh_rules_status()
+
+    def _emit_event(
+        self,
+        *,
+        event_type: str,
+        category: str,
+        severity: str,
+        source: str,
+        message: str,
+        payload: dict[str, Any] | None = None,
+        evaluate_rules: bool = True,
+    ) -> None:
+        event_payload = dict(payload) if isinstance(payload, dict) else {}
+        event_payload.setdefault("message", message)
+        event = self._normalize_event(
+            event_type=event_type,
+            category=category,
+            severity=severity,
+            source=source,
+            payload=event_payload,
+        )
+        self.normalized_event_log.append(event)
+        self.normalized_event_log = self.normalized_event_log[-self.max_normalized_events :]
+        stamp = time.strftime("%H:%M:%S")
+        line = f"{stamp} | {message}"
         self.event_timeline.append(line)
         self.event_timeline = self.event_timeline[-160:]
-        if self._is_recovery_event_text(text):
+        if self._is_recovery_event_text(message):
             self.recovery_timeline.append(line)
             self.recovery_timeline = self.recovery_timeline[-180:]
             self._refresh_recovery_history_view()
         self._refresh_event_history_view()
+        if evaluate_rules:
+            self._evaluate_rules_for_event(event)
+
+    def _record_event(self, text: str) -> None:
+        if self._enqueue_on_ui_thread(self._record_event, text):
+            return
+        self._emit_event(
+            event_type="app.event",
+            category=self._event_category_from_text(text),
+            severity=self._event_severity_from_text(text),
+            source="app",
+            message=text,
+            payload={"text": text},
+            evaluate_rules=True,
+        )
 
     @staticmethod
     def _is_recovery_event_text(text: str) -> bool:
@@ -2432,6 +2821,8 @@ class AntiAfkApp:
             return "scheduler" in hay
         if mode == "updates":
             return "update" in hay
+        if mode == "rules":
+            return "rule" in hay
         return True
 
     def _refresh_event_history_view(self) -> None:
@@ -2550,7 +2941,14 @@ class AntiAfkApp:
         self.last_vendor_alert_at[vendor] = now
         readable = vendor.title()
         self.log(f"{readable} event detected ({source}).")
-        self._record_event(f"Vendor alert: {readable} ({source})")
+        self._emit_event(
+            event_type="vendor.detected",
+            category="vendor",
+            severity="info",
+            source="biome-tracker",
+            message=f"Vendor alert: {readable} ({source})",
+            payload={"vendor": vendor, "source": source},
+        )
         self._send_webhook(
             f"{APP_NAME} {readable} Alert",
             f"Detected {readable} event from {source}.",
@@ -2571,6 +2969,14 @@ class AntiAfkApp:
         if changed:
             self.biome_counts[biome] = self.biome_counts.get(biome, 0) + 1
             self.log(f"Biome detected: {biome} ({source}).")
+            self._emit_event(
+                event_type="biome.detected",
+                category="biome",
+                severity="info",
+                source="biome-tracker",
+                message=f"Biome detected: {biome} ({source})",
+                payload={"biome": biome, "source": source},
+            )
             self._append_biome_history(biome, source)
         self._maybe_send_biome_alert(biome)
         self._render_biome_badge()
@@ -2865,6 +3271,46 @@ class AntiAfkApp:
             raise ValueError("Auto-relaunch max launches/hr must be between 1 and 120.")
         return value
 
+    def parse_instance_relaunch_cooldown_seconds(self) -> float:
+        raw = self.instance_relaunch_cooldown_seconds_var.get().strip()
+        try:
+            value = float(raw)
+        except ValueError as exc:
+            raise ValueError("Auto-relaunch cooldown must be a number (seconds).") from exc
+        if value < 2 or value > 300:
+            raise ValueError("Auto-relaunch cooldown must be between 2 and 300 seconds.")
+        return value
+
+    @staticmethod
+    def _normalize_relaunch_playbook_name(raw: str) -> str:
+        name = raw.strip().lower()
+        if name in {"custom", "conservative", "balanced", "aggressive"}:
+            return name
+        return "custom"
+
+    def apply_relaunch_playbook(self) -> None:
+        playbook = self._normalize_relaunch_playbook_name(self.instance_relaunch_playbook_var.get())
+        self.instance_relaunch_playbook_var.set(playbook)
+        if playbook == "custom":
+            self._sync_runtime_settings_from_ui()
+            self.log("Relaunch playbook set to custom (manual parameters).")
+            self._record_event("Relaunch playbook: custom")
+            return
+        template = RELAUNCH_PLAYBOOKS.get(playbook)
+        if not template:
+            return
+        self.instance_relaunch_grace_seconds_var.set(str(int(template.get("grace_seconds", 45))))
+        self.instance_relaunch_max_per_hour_var.set(str(int(template.get("max_per_hour", 8))))
+        self.instance_relaunch_cooldown_seconds_var.set(str(int(template.get("cooldown_seconds", 20))))
+        self._sync_runtime_settings_from_ui()
+        self.log(
+            "Relaunch playbook applied: "
+            f"{playbook} (grace={self.instance_relaunch_grace_seconds_var.get()}s, "
+            f"max/hr={self.instance_relaunch_max_per_hour_var.get()}, "
+            f"cooldown={self.instance_relaunch_cooldown_seconds_var.get()}s)."
+        )
+        self._record_event(f"Relaunch playbook: {playbook}")
+
     def parse_vendor_alert_cooldown_seconds(self) -> int:
         raw = self.vendor_alert_cooldown_var.get().strip()
         try:
@@ -3010,6 +3456,14 @@ class AntiAfkApp:
             self.runtime_process_limiter_only_when_running = False
             self.runtime_process_limiter_target_percent = 0
         self.runtime_instance_relaunch_enabled = bool(self.instance_relaunch_enabled_var.get())
+        playbook = self._normalize_relaunch_playbook_name(self.instance_relaunch_playbook_var.get())
+        self.instance_relaunch_playbook_var.set(playbook)
+        self.runtime_instance_relaunch_playbook = playbook
+        if playbook != "custom":
+            template = RELAUNCH_PLAYBOOKS.get(playbook, RELAUNCH_PLAYBOOKS["balanced"])
+            self.instance_relaunch_grace_seconds_var.set(str(int(template.get("grace_seconds", 45))))
+            self.instance_relaunch_max_per_hour_var.set(str(int(template.get("max_per_hour", 8))))
+            self.instance_relaunch_cooldown_seconds_var.set(str(int(template.get("cooldown_seconds", 20))))
         try:
             self.runtime_instance_relaunch_grace_seconds = self.parse_instance_relaunch_grace_seconds()
         except Exception:
@@ -3018,6 +3472,11 @@ class AntiAfkApp:
             self.runtime_instance_relaunch_max_per_hour = self.parse_instance_relaunch_max_per_hour()
         except Exception:
             pass
+        try:
+            self.runtime_instance_relaunch_cooldown_seconds = self.parse_instance_relaunch_cooldown_seconds()
+        except Exception:
+            pass
+        self.instance_relaunch_min_interval_seconds = max(2.0, self.runtime_instance_relaunch_cooldown_seconds)
         self.runtime_instance_relaunch_launch_target = self.instance_relaunch_launch_target_var.get().strip()
         self.runtime_account_roster_enabled = bool(self.account_roster_enabled_var.get())
         self.runtime_watchdog_standby_mode = bool(self.watchdog_standby_mode_var.get())
@@ -3031,6 +3490,8 @@ class AntiAfkApp:
             self.runtime_rare_biome_confirm_seconds = self.parse_rare_biome_confirm_seconds()
         except Exception:
             pass
+        self.runtime_rules_mode_enabled = bool(self.rules_mode_enabled_var.get())
+        self._refresh_rules_status()
 
     def parse_interval(self) -> float:
         raw = self.interval_var.get().strip()
@@ -3155,6 +3616,7 @@ class AntiAfkApp:
         if self.instance_relaunch_enabled_var.get():
             self.parse_instance_relaunch_grace_seconds()
             self.parse_instance_relaunch_max_per_hour()
+            self.parse_instance_relaunch_cooldown_seconds()
             target = self.instance_relaunch_launch_target_var.get().strip()
             if not self._is_valid_instance_relaunch_target(target):
                 raise ValueError(
@@ -4501,9 +4963,23 @@ class AntiAfkApp:
 
     def _start_identity_lookup(self, pid: int) -> None:
         with self.state_lock:
+            pin = self.pid_identity_session_pins.get(pid)
+            if isinstance(pin, dict):
+                pinned_username = str(pin.get("username", "")).strip()
+                pinned_user_id = pin.get("user_id")
+                if pinned_username:
+                    self.pid_username[pid] = pinned_username
+                if isinstance(pinned_user_id, int) and pinned_user_id > 0:
+                    self.pid_user_id[pid] = pinned_user_id
+                self.pid_identity_confidence[pid] = "pinned"
+                self.pid_identity_reason[pid] = "Session pin active"
+                self.identity_last_attempt[pid] = time.time()
+                return
             if pid in self.identity_lookup_inflight:
                 return
             self.identity_lookup_inflight.add(pid)
+            self.pid_identity_retry_count[pid] = self.pid_identity_retry_count.get(pid, 0) + 1
+            self.pid_identity_last_retry_at[pid] = time.time()
             self.identity_last_attempt[pid] = time.time()
         threading.Thread(target=self._identity_lookup_worker, args=(pid,), daemon=True).start()
 
@@ -4527,9 +5003,22 @@ class AntiAfkApp:
         avatar_bytes: bytes | None,
     ) -> None:
         conflict_reason = ""
+        identity_reason = ""
         with self.state_lock:
             self.identity_lookup_inflight.discard(pid)
             active_pids = {active_pid for _hwnd, _title, active_pid, _pname in self.window_map}
+            pin = self.pid_identity_session_pins.get(pid)
+            if isinstance(pin, dict):
+                pinned_username = str(pin.get("username", "")).strip()
+                pinned_user_id = pin.get("user_id")
+                if pinned_username:
+                    self.pid_username[pid] = pinned_username
+                if isinstance(pinned_user_id, int) and pinned_user_id > 0:
+                    self.pid_user_id[pid] = pinned_user_id
+                self.pid_identity_confidence[pid] = "pinned"
+                self.pid_identity_reason[pid] = "Session pin active"
+                self.refresh_instance_list(manual=False)
+                return
             if user_id is not None:
                 owner_pid = next(
                     (
@@ -4559,6 +5048,9 @@ class AntiAfkApp:
                 self.pid_user_id.pop(pid, None)
                 self.pid_log_hint.pop(pid, None)
                 self.pid_identity_confidence[pid] = "conflict"
+                self.pid_identity_conflict_count[pid] = self.pid_identity_conflict_count.get(pid, 0) + 1
+                self.pid_identity_last_conflict_reason[pid] = conflict_reason
+                self.pid_identity_reason[pid] = conflict_reason
                 self.identity_last_attempt[pid] = max(0.0, time.time() - 10.0)
             else:
                 if username:
@@ -4576,6 +5068,17 @@ class AntiAfkApp:
                         if isinstance(cached_priority, int) and 1 <= cached_priority <= 9:
                             self.instance_priority_by_pid[pid] = cached_priority
                 self.pid_identity_confidence[pid] = confidence
+                if confidence == "api":
+                    identity_reason = "Resolved from log+Roblox API"
+                elif confidence == "log":
+                    identity_reason = "Resolved from log signal only"
+                elif confidence == "unknown":
+                    identity_reason = "No identity signal found yet"
+                elif confidence == "error":
+                    identity_reason = "Lookup worker error"
+                else:
+                    identity_reason = f"Lookup status: {confidence}"
+                self.pid_identity_reason[pid] = identity_reason
                 if user_id is not None:
                     self.pid_user_id[pid] = user_id
         if conflict_reason:
@@ -4653,6 +5156,20 @@ class AntiAfkApp:
                 pid: ts for pid, ts in self.pid_aura_log_discovery_last_attempt.items() if pid in active_pids
             }
             self.pid_create_time_cache = {pid: ts for pid, ts in self.pid_create_time_cache.items() if pid in active_pids}
+            self.pid_identity_reason = {pid: reason for pid, reason in self.pid_identity_reason.items() if pid in active_pids}
+            self.pid_identity_conflict_count = {
+                pid: count for pid, count in self.pid_identity_conflict_count.items() if pid in active_pids
+            }
+            self.pid_identity_last_conflict_reason = {
+                pid: reason for pid, reason in self.pid_identity_last_conflict_reason.items() if pid in active_pids
+            }
+            self.pid_identity_retry_count = {pid: count for pid, count in self.pid_identity_retry_count.items() if pid in active_pids}
+            self.pid_identity_last_retry_at = {
+                pid: ts for pid, ts in self.pid_identity_last_retry_at.items() if pid in active_pids
+            }
+            self.pid_identity_session_pins = {
+                pid: pin for pid, pin in self.pid_identity_session_pins.items() if pid in active_pids
+            }
             self.singleton_cleanup_last_attempt_by_pid = {
                 pid: ts for pid, ts in self.singleton_cleanup_last_attempt_by_pid.items() if pid in active_pids
             }
@@ -4699,6 +5216,10 @@ class AntiAfkApp:
             if not username:
                 username = "Detecting..." if pid in self.identity_lookup_inflight else "Unknown"
             confidence = self.pid_identity_confidence.get(pid, "unknown")
+            with self.state_lock:
+                pin = self.pid_identity_session_pins.get(pid)
+            if isinstance(pin, dict):
+                confidence = "pinned"
             aura = self.pid_equipped_aura.get(pid, "-")
             priority = self.instance_priority_by_pid.get(pid, 1)
             last_jump = self.instance_last_jump.get(hwnd)
@@ -4744,6 +5265,7 @@ class AntiAfkApp:
 
         self._refresh_account_roster_status()
         self.update_health_panel()
+        self.refresh_identity_reliability_panel()
         self._refresh_process_limiter_status()
         if manual:
             self.log("Instance list refreshed.")
@@ -4862,9 +5384,137 @@ class AntiAfkApp:
                 self.pid_user_id.pop(pid, None)
                 self.pid_avatar_photo.pop(pid, None)
                 self.pid_identity_confidence.pop(pid, None)
+                self.pid_identity_reason.pop(pid, None)
                 self.identity_last_attempt[pid] = 0
             self._start_identity_lookup(pid)
         self.log("Requested identity retry for selected instances.")
+        self.refresh_identity_reliability_panel()
+
+    def clear_selected_identity_cache(self) -> None:
+        selected = self.instance_tree.selection()
+        if not selected:
+            self.log("Clear identity cache skipped: no row selected.")
+            return
+        cleared = 0
+        for item in selected:
+            try:
+                hwnd = int(item)
+            except ValueError:
+                continue
+            with self.state_lock:
+                pid = next((pid for h, _t, pid, _p in self.window_map if h == hwnd), None)
+                if pid is None:
+                    continue
+                self.pid_username.pop(pid, None)
+                self.pid_user_id.pop(pid, None)
+                self.pid_avatar_photo.pop(pid, None)
+                self.pid_identity_confidence.pop(pid, None)
+                self.pid_identity_reason.pop(pid, None)
+                self.pid_log_hint.pop(pid, None)
+                self.pid_identity_session_pins.pop(pid, None)
+                self.identity_lookup_inflight.discard(pid)
+                self.identity_last_attempt[pid] = 0
+                cleared += 1
+        if cleared > 0:
+            self.log(f"Cleared identity cache for {cleared} selected instance(s).")
+            self.refresh_instance_list(manual=False)
+        self.refresh_identity_reliability_panel()
+
+    def pin_selected_identity_session(self) -> None:
+        selected = self.instance_tree.selection()
+        if not selected:
+            self.log("Pin session skipped: no row selected.")
+            return
+        pinned = 0
+        for item in selected:
+            try:
+                hwnd = int(item)
+            except ValueError:
+                continue
+            with self.state_lock:
+                pid = next((pid for h, _t, pid, _p in self.window_map if h == hwnd), None)
+                if pid is None:
+                    continue
+                username = self.pid_username.get(pid, "").strip()
+                user_id = self.pid_user_id.get(pid)
+                if not username and not isinstance(user_id, int):
+                    continue
+                self.pid_identity_session_pins[pid] = {"username": username, "user_id": user_id, "pinned_at": time.time()}
+                self.pid_identity_confidence[pid] = "pinned"
+                self.pid_identity_reason[pid] = "Session pin active"
+                pinned += 1
+        if pinned > 0:
+            self.log(f"Pinned identity mapping for {pinned} selected instance(s) (session only).")
+            self.refresh_instance_list(manual=False)
+        self.refresh_identity_reliability_panel()
+
+    def unpin_selected_identity_session(self) -> None:
+        selected = self.instance_tree.selection()
+        if not selected:
+            self.log("Unpin session skipped: no row selected.")
+            return
+        unpinned = 0
+        for item in selected:
+            try:
+                hwnd = int(item)
+            except ValueError:
+                continue
+            with self.state_lock:
+                pid = next((pid for h, _t, pid, _p in self.window_map if h == hwnd), None)
+                if pid is None:
+                    continue
+                if pid in self.pid_identity_session_pins:
+                    self.pid_identity_session_pins.pop(pid, None)
+                    if self.pid_identity_confidence.get(pid) == "pinned":
+                        self.pid_identity_confidence[pid] = "unknown"
+                        self.pid_identity_reason[pid] = "Session pin removed; awaiting lookup"
+                        self.identity_last_attempt[pid] = 0
+                    unpinned += 1
+        if unpinned > 0:
+            self.log(f"Removed session identity pin for {unpinned} selected instance(s).")
+            self.refresh_instance_list(manual=False)
+        self.refresh_identity_reliability_panel()
+
+    def on_instance_selection_changed(self, _event: tk.Event | None = None) -> None:
+        self.refresh_identity_reliability_panel()
+
+    def refresh_identity_reliability_panel(self) -> None:
+        if not hasattr(self, "instance_tree"):
+            return
+        selected = self.instance_tree.selection()
+        if not selected:
+            self.identity_reliability_summary_var.set("Identity Reliability: no selection")
+            self.identity_reliability_detail_var.set("Select an instance row to inspect status/reason.")
+            return
+        try:
+            hwnd = int(selected[0])
+        except ValueError:
+            self.identity_reliability_summary_var.set("Identity Reliability: invalid selection")
+            self.identity_reliability_detail_var.set("Selected row is invalid.")
+            return
+        with self.state_lock:
+            row = next(((h, t, p, n) for h, t, p, n in self.window_map if h == hwnd), None)
+            if row is None:
+                self.identity_reliability_summary_var.set("Identity Reliability: stale selection")
+                self.identity_reliability_detail_var.set("Selected instance is no longer active.")
+                return
+            _h, title, pid, _pname = row
+            confidence = self.pid_identity_confidence.get(pid, "unknown")
+            reason = self.pid_identity_reason.get(pid, "No reason available")
+            conflict_count = self.pid_identity_conflict_count.get(pid, 0)
+            last_conflict = self.pid_identity_last_conflict_reason.get(pid, "-")
+            retry_count = self.pid_identity_retry_count.get(pid, 0)
+            last_retry_at = self.pid_identity_last_retry_at.get(pid, 0.0)
+            is_pinned = pid in self.pid_identity_session_pins
+            username = self.pid_username.get(pid, "Unknown")
+        self.identity_reliability_summary_var.set(
+            f"Identity Reliability | PID {pid} | user {username} | confidence={confidence.upper()}"
+        )
+        self.identity_reliability_detail_var.set(
+            f"status={reason}; conflicts={conflict_count}; last_conflict={last_conflict}; "
+            f"retries={retry_count}; last_retry={self._format_seconds_ago(last_retry_at)}; "
+            f"session_pin={'ON' if is_pinned else 'OFF'}; title={title[:72]}"
+        )
 
     def enable_all_instances(self) -> None:
         with self.state_lock:
@@ -5468,6 +6118,35 @@ class AntiAfkApp:
     def _set_instance_relaunch_status(self, text: str) -> None:
         self.instance_relaunch_status_var.set(text)
 
+    @staticmethod
+    def _format_seconds_ago(timestamp: float) -> str:
+        if timestamp <= 0:
+            return "never"
+        delta = max(0, int(time.time() - timestamp))
+        if delta < 60:
+            return f"{delta}s ago"
+        minutes, seconds = divmod(delta, 60)
+        if minutes < 60:
+            return f"{minutes}m {seconds}s ago"
+        hours, minutes = divmod(minutes, 60)
+        return f"{hours}h {minutes}m ago"
+
+    def _record_relaunch_decision(self, state: str, reason: str, details: dict[str, Any] | None = None) -> None:
+        payload = {
+            "timestamp": datetime.now(timezone.utc).isoformat(timespec="milliseconds"),
+            "state": state.strip().lower() or "no-op",
+            "reason": reason.strip() or "-",
+            "details": dict(details) if isinstance(details, dict) else {},
+        }
+        signature = f"{payload['state']}|{payload['reason']}|{json.dumps(payload['details'], sort_keys=True)}"
+        now = time.time()
+        if signature != self.instance_relaunch_last_trace_signature or (now - self.instance_relaunch_last_trace_at) >= 2.0:
+            self.instance_relaunch_decision_trace.append(payload)
+            self.instance_relaunch_decision_trace = self.instance_relaunch_decision_trace[-180:]
+            self.instance_relaunch_last_trace_signature = signature
+            self.instance_relaunch_last_trace_at = now
+        self.instance_relaunch_decision_reason_var.set(f"Reason: {reason}")
+
     def _reset_instance_relaunch_state(self, reset_target: bool) -> None:
         self.instance_relaunch_drop_since = None
         self.instance_relaunch_recovered_logged = False
@@ -5475,6 +6154,10 @@ class AntiAfkApp:
         self.instance_relaunch_wait_until = 0.0
         self.instance_relaunch_attempt_timestamps.clear()
         self.instance_relaunch_last_log_at = 0.0
+        self.instance_relaunch_decision_trace.clear()
+        self.instance_relaunch_last_trace_signature = ""
+        self.instance_relaunch_last_trace_at = 0.0
+        self.instance_relaunch_decision_reason_var.set("Reason: idle")
         self.account_roster_missing_since_by_user_id.clear()
         if reset_target:
             self.instance_relaunch_target_count = 0
@@ -5670,10 +6353,13 @@ class AntiAfkApp:
             self.instance_relaunch_recovered_logged = False
             if self.runtime_watchdog_standby_mode and not self.is_running and not self.runtime_instance_relaunch_enabled:
                 self._set_instance_relaunch_status("Standby active (auto-relaunch disabled).")
+                self._record_relaunch_decision("no-op", "Standby mode active; auto-relaunch disabled")
             elif not self.is_running and not self.runtime_watchdog_standby_mode:
                 self._set_instance_relaunch_status("Relaunch idle (standby off).")
+                self._record_relaunch_decision("no-op", "Loop stopped and standby mode is off")
             else:
                 self._set_instance_relaunch_status("Relaunch idle.")
+                self._record_relaunch_decision("no-op", "Auto-relaunch disabled")
             return
 
         now = time.time()
@@ -5717,6 +6403,11 @@ class AntiAfkApp:
                 extras = max(0, current_count - target_count)
                 extra_suffix = f" (+{extras} extra)" if extras > 0 else ""
                 self._set_instance_relaunch_status(f"Healthy roster {target_count}/{target_count}{extra_suffix}.")
+                self._record_relaunch_decision(
+                    "no-op",
+                    "Roster healthy",
+                    {"active": current_count, "target": target_count, "extras": extras},
+                )
                 return
             self.instance_relaunch_recovered_logged = False
             unresolved_cover = min(unresolved_identity, len(missing_ids))
@@ -5725,11 +6416,21 @@ class AntiAfkApp:
                 self._set_instance_relaunch_status(
                     f"Roster waiting on identity ({len(missing_ids)} unresolved roster slot(s))."
                 )
+                self._record_relaunch_decision(
+                    "no-op",
+                    "Roster missing accounts but unresolved identities may cover gap",
+                    {"missing": len(missing_ids), "unresolved_identity": unresolved_identity},
+                )
                 return
             if now < self.instance_relaunch_wait_until:
                 wait_left = max(0, int(self.instance_relaunch_wait_until - now))
                 self._set_instance_relaunch_status(
                     f"Waiting spawn for roster ({uncovered_missing} missing, {wait_left}s)."
+                )
+                self._record_relaunch_decision(
+                    "cooldown",
+                    "Spawn wait window active after prior relaunch",
+                    {"wait_left_seconds": wait_left, "missing": uncovered_missing, "target": target_count},
                 )
                 return
             mature_uncovered = max(0, len(mature_missing_ids) - unresolved_cover)
@@ -5741,11 +6442,25 @@ class AntiAfkApp:
                 self._set_instance_relaunch_status(
                     f"Roster missing {uncovered_missing}/{target_count}{identity_hint}; relaunch in {grace_left}s."
                 )
+                self._record_relaunch_decision(
+                    "no-op",
+                    "Roster grace window active",
+                    {
+                        "grace_left_seconds": grace_left,
+                        "missing": uncovered_missing,
+                        "target": target_count,
+                    },
+                )
                 return
             if (now - self.instance_relaunch_last_attempt_at) < self.instance_relaunch_min_interval_seconds:
                 retry_left = max(0, int(self.instance_relaunch_min_interval_seconds - (now - self.instance_relaunch_last_attempt_at)))
                 self._set_instance_relaunch_status(
                     f"Relaunch cooldown {retry_left}s (roster missing {uncovered_missing}/{target_count})."
+                )
+                self._record_relaunch_decision(
+                    "cooldown",
+                    "Per-attempt cooldown active",
+                    {"retry_left_seconds": retry_left, "missing": uncovered_missing, "target": target_count},
                 )
                 return
 
@@ -5767,6 +6482,14 @@ class AntiAfkApp:
                     )
                 self._set_instance_relaunch_status(
                     f"Launch cap reached ({self.runtime_instance_relaunch_max_per_hour}/hr)."
+                )
+                self._record_relaunch_decision(
+                    "cap",
+                    "Hourly relaunch cap reached",
+                    {
+                        "launches_used": launches_used,
+                        "max_per_hour": self.runtime_instance_relaunch_max_per_hour,
+                    },
                 )
                 return
 
@@ -5795,11 +6518,17 @@ class AntiAfkApp:
                 self._set_instance_relaunch_status(
                     f"Relaunch started x{launched}; roster missing {uncovered_missing}/{target_count}."
                 )
+                self._record_relaunch_decision(
+                    "launch",
+                    f"Launched {launched} instance(s) for missing roster coverage",
+                    {"launched": launched, "missing": uncovered_missing, "target": target_count},
+                )
                 self.refresh_instance_list(manual=False)
                 return
 
             self.instance_relaunch_drop_since = now
             self._set_instance_relaunch_status("Relaunch attempt failed; retrying later.")
+            self._record_relaunch_decision("no-op", "Relaunch attempt failed to start process")
             return
 
         with self.state_lock:
@@ -5809,11 +6538,17 @@ class AntiAfkApp:
             self.instance_relaunch_drop_since = None
             self.instance_relaunch_recovered_logged = False
             self._set_instance_relaunch_status(f"Watching {current_count} instance(s).")
+            self._record_relaunch_decision(
+                "no-op",
+                "Raised baseline target to observed healthy count",
+                {"target": current_count},
+            )
             return
         if self.instance_relaunch_target_count <= 0:
             self.instance_relaunch_target_count = current_count
             self.instance_relaunch_recovered_logged = False
             self._set_instance_relaunch_status("Waiting for baseline instances.")
+            self._record_relaunch_decision("no-op", "Waiting for baseline instance count")
             return
 
         missing = self.instance_relaunch_target_count - current_count
@@ -5829,6 +6564,11 @@ class AntiAfkApp:
                 self.instance_relaunch_recovered_logged = True
             self.instance_relaunch_drop_since = None
             self._set_instance_relaunch_status(f"Healthy {current_count}/{self.instance_relaunch_target_count}.")
+            self._record_relaunch_decision(
+                "no-op",
+                "Baseline healthy",
+                {"active": current_count, "target": self.instance_relaunch_target_count},
+            )
             return
         self.instance_relaunch_recovered_logged = False
 
@@ -5836,6 +6576,15 @@ class AntiAfkApp:
             wait_left = max(0, int(self.instance_relaunch_wait_until - now))
             self._set_instance_relaunch_status(
                 f"Waiting spawn {current_count}/{self.instance_relaunch_target_count} ({wait_left}s)."
+            )
+            self._record_relaunch_decision(
+                "cooldown",
+                "Spawn wait window active after prior relaunch",
+                {
+                    "wait_left_seconds": wait_left,
+                    "active": current_count,
+                    "target": self.instance_relaunch_target_count,
+                },
             )
             return
         if self.instance_relaunch_drop_since is None:
@@ -5845,20 +6594,52 @@ class AntiAfkApp:
                 self._set_instance_relaunch_status(
                     f"Drop detected {current_count}/{self.instance_relaunch_target_count}; grace window."
                 )
+                self._record_relaunch_decision(
+                    "no-op",
+                    "Drop detected; waiting grace window",
+                    {
+                        "active": current_count,
+                        "target": self.instance_relaunch_target_count,
+                        "grace_seconds": self.runtime_instance_relaunch_grace_seconds,
+                    },
+                )
                 return
             self._set_instance_relaunch_status(
                 f"Drop detected {current_count}/{self.instance_relaunch_target_count}; launching now."
+            )
+            self._record_relaunch_decision(
+                "launch",
+                "Drop detected and grace disabled; launch immediately",
+                {"active": current_count, "target": self.instance_relaunch_target_count},
             )
         if (now - self.instance_relaunch_drop_since) < self.runtime_instance_relaunch_grace_seconds:
             grace_left = max(0, int(self.runtime_instance_relaunch_grace_seconds - (now - self.instance_relaunch_drop_since)))
             self._set_instance_relaunch_status(
                 f"Drop persists {current_count}/{self.instance_relaunch_target_count}; relaunch in {grace_left}s."
             )
+            self._record_relaunch_decision(
+                "no-op",
+                "Drop persists; grace countdown active",
+                {
+                    "grace_left_seconds": grace_left,
+                    "active": current_count,
+                    "target": self.instance_relaunch_target_count,
+                },
+            )
             return
         if (now - self.instance_relaunch_last_attempt_at) < self.instance_relaunch_min_interval_seconds:
             retry_left = max(0, int(self.instance_relaunch_min_interval_seconds - (now - self.instance_relaunch_last_attempt_at)))
             self._set_instance_relaunch_status(
                 f"Relaunch cooldown {retry_left}s ({current_count}/{self.instance_relaunch_target_count})."
+            )
+            self._record_relaunch_decision(
+                "cooldown",
+                "Per-attempt cooldown active",
+                {
+                    "retry_left_seconds": retry_left,
+                    "active": current_count,
+                    "target": self.instance_relaunch_target_count,
+                },
             )
             return
 
@@ -5880,6 +6661,14 @@ class AntiAfkApp:
                 )
             self._set_instance_relaunch_status(
                 f"Launch cap reached ({self.runtime_instance_relaunch_max_per_hour}/hr)."
+            )
+            self._record_relaunch_decision(
+                "cap",
+                "Hourly relaunch cap reached",
+                {
+                    "launches_used": launches_used,
+                    "max_per_hour": self.runtime_instance_relaunch_max_per_hour,
+                },
             )
             return
 
@@ -5906,11 +6695,21 @@ class AntiAfkApp:
             self._set_instance_relaunch_status(
                 f"Relaunch started x{launched}; waiting for clients ({current_count}/{self.instance_relaunch_target_count})."
             )
+            self._record_relaunch_decision(
+                "launch",
+                f"Launched {launched} instance(s) to recover baseline",
+                {
+                    "launched": launched,
+                    "active": current_count,
+                    "target": self.instance_relaunch_target_count,
+                },
+            )
             self.refresh_instance_list(manual=False)
             return
 
         self.instance_relaunch_drop_since = now
         self._set_instance_relaunch_status("Relaunch attempt failed; retrying later.")
+        self._record_relaunch_decision("no-op", "Relaunch attempt failed to start process")
 
     def _effective_pattern(self, pid: int) -> str:
         pattern = self.instance_pattern_override.get(pid, "").strip().lower()
@@ -6379,6 +7178,7 @@ class AntiAfkApp:
                 self._check_dropped_instance_relaunch()
                 self._poll_biome_tracker()
                 self._maybe_send_biome_alert(self.current_biome_name)
+                self._refresh_rules_status()
             self._check_profile_scheduler()
             self._check_instance_health_alerts()
             if not iconic:
@@ -6561,6 +7361,8 @@ class AntiAfkApp:
             "instance_relaunch_enabled": bool(self.instance_relaunch_enabled_var.get()),
             "instance_relaunch_grace_seconds": self.instance_relaunch_grace_seconds_var.get().strip(),
             "instance_relaunch_max_per_hour": self.instance_relaunch_max_per_hour_var.get().strip(),
+            "instance_relaunch_cooldown_seconds": self.instance_relaunch_cooldown_seconds_var.get().strip(),
+            "instance_relaunch_playbook": self._normalize_relaunch_playbook_name(self.instance_relaunch_playbook_var.get()),
             "instance_relaunch_launch_target": self.instance_relaunch_launch_target_var.get().strip(),
             "account_roster_enabled": bool(self.account_roster_enabled_var.get()),
             "watchdog_standby_mode": bool(self.watchdog_standby_mode_var.get()),
@@ -6581,6 +7383,9 @@ class AntiAfkApp:
             "vendor_alerts_enabled": bool(self.vendor_alerts_enabled_var.get()),
             "vendor_alert_cooldown": self.vendor_alert_cooldown_var.get().strip(),
             "recovery_enabled": bool(self.recovery_enabled_var.get()),
+            "rules_mode_enabled": bool(self.rules_mode_enabled_var.get()),
+            "rules_verbose_logging": bool(self.rules_verbose_logging_var.get()),
+            "rules_definitions": self.rules_definitions,
             "instance_interval_override_by_pid": {str(pid): value for pid, value in interval_override_snapshot.items()},
             "instance_pattern_override_by_pid": {str(pid): value for pid, value in pattern_override_snapshot.items()},
             "instance_priority_by_pid": {str(pid): value for pid, value in priority_snapshot.items()},
@@ -6622,6 +7427,19 @@ class AntiAfkApp:
             if not isinstance(value, list):
                 data.pop(key, None)
                 changed = True
+        raw_rules = data.get("rules_definitions")
+        if raw_rules is not None and not isinstance(raw_rules, list):
+            data.pop("rules_definitions", None)
+            changed = True
+        if "instance_relaunch_playbook" in data:
+            if not isinstance(data.get("instance_relaunch_playbook"), str):
+                data["instance_relaunch_playbook"] = "custom"
+                changed = True
+            else:
+                normalized_playbook = self._normalize_relaunch_playbook_name(str(data.get("instance_relaunch_playbook", "custom")))
+                if normalized_playbook != str(data.get("instance_relaunch_playbook", "custom")).strip().lower():
+                    data["instance_relaunch_playbook"] = normalized_playbook
+                    changed = True
         return data, changed
 
     def _backup_invalid_config(self) -> str | None:
@@ -6773,6 +7591,10 @@ class AntiAfkApp:
         self.instance_relaunch_enabled_var.set(bool(data.get("instance_relaunch_enabled", False)))
         self.instance_relaunch_grace_seconds_var.set(str(data.get("instance_relaunch_grace_seconds", "45")))
         self.instance_relaunch_max_per_hour_var.set(str(data.get("instance_relaunch_max_per_hour", "8")))
+        self.instance_relaunch_cooldown_seconds_var.set(str(data.get("instance_relaunch_cooldown_seconds", "20")))
+        self.instance_relaunch_playbook_var.set(
+            self._normalize_relaunch_playbook_name(str(data.get("instance_relaunch_playbook", "custom")))
+        )
         self.instance_relaunch_launch_target_var.set(str(data.get("instance_relaunch_launch_target", "")).strip())
         self.account_roster_enabled_var.set(bool(data.get("account_roster_enabled", False)))
         self.watchdog_standby_mode_var.set(bool(data.get("watchdog_standby_mode", False)))
@@ -6800,10 +7622,22 @@ class AntiAfkApp:
         self.vendor_alerts_enabled_var.set(bool(data.get("vendor_alerts_enabled", False)))
         self.vendor_alert_cooldown_var.set(str(data.get("vendor_alert_cooldown", "180")))
         self.recovery_enabled_var.set(bool(data.get("recovery_enabled", True)))
+        self.rules_mode_enabled_var.set(bool(data.get("rules_mode_enabled", False)))
+        self.rules_verbose_logging_var.set(bool(data.get("rules_verbose_logging", False)))
+        self.rules_definitions = self._normalize_rules_definitions(data.get("rules_definitions", []))
+        self.rules_last_trigger_at_by_id.clear()
+        self.rules_last_match_at_by_id.clear()
+        self.rules_total_matches = 0
+        self.rules_total_actions = 0
+        self.rules_execution_log.clear()
+        if hasattr(self, "rules_history_list"):
+            self.rules_history_list.delete(0, tk.END)
+        self.rules_last_match_var.set("Last rule: -")
         self._apply_selected_theme()
         self._sync_runtime_settings_from_ui()
         self._set_global_hotkeys_enabled(self.hotkeys_enabled_var.get(), log_result=False)
         self._refresh_account_roster_status()
+        self._refresh_rules_status()
         self.refresh_instance_list(manual=False)
 
     @staticmethod
@@ -6906,6 +7740,17 @@ class AntiAfkApp:
         latest_log = self._find_latest_biome_log() or "none"
         configured_webhook_urls = self._configured_webhook_urls()
         webhook_on = self.webhook_enabled_var.get() and bool(configured_webhook_urls)
+        with self.state_lock:
+            active_pids = {pid for _hwnd, _title, pid, _pname in self.window_map}
+            conflict_total = sum(self.pid_identity_conflict_count.get(pid, 0) for pid in active_pids)
+            pinned_total = sum(1 for pid in active_pids if pid in self.pid_identity_session_pins)
+            retry_total = sum(self.pid_identity_retry_count.get(pid, 0) for pid in active_pids)
+            recent_trace = list(self.instance_relaunch_decision_trace[-6:])
+            recent_conflicts = [
+                f"PID {pid}: {self.pid_identity_last_conflict_reason.get(pid, '-')[:120]}"
+                for pid in sorted(active_pids)
+                if self.pid_identity_last_conflict_reason.get(pid)
+            ][:4]
         try:
             self._validate_pause_schedule()
             pause_validation = "OK"
@@ -6938,11 +7783,17 @@ class AntiAfkApp:
             f"Process limiter runtime support: {'YES' if self.process_limiter_supported else 'NO'}",
             f"Process limiter status: {self.process_limiter_status_var.get()}",
             f"Auto-relaunch dropped instances: {'ON' if self.instance_relaunch_enabled_var.get() else 'OFF'} (grace={self.instance_relaunch_grace_seconds_var.get().strip() or '45'}s, max/hr={self.instance_relaunch_max_per_hour_var.get().strip() or '8'})",
+            f"Auto-relaunch cooldown: {self.instance_relaunch_cooldown_seconds_var.get().strip() or '20'}s",
+            f"Auto-relaunch playbook: {self._normalize_relaunch_playbook_name(self.instance_relaunch_playbook_var.get())}",
             f"Auto-relaunch target: {self.instance_relaunch_launch_target_var.get().strip() or 'auto-detect launcher'}",
             f"Auto-relaunch status: {self.instance_relaunch_status_var.get()}",
+            f"Auto-relaunch decision reason: {self.instance_relaunch_decision_reason_var.get()}",
             f"Watchdog standby mode: {'ON' if self.watchdog_standby_mode_var.get() else 'OFF'}",
             f"Account roster mode: {'ON' if self.account_roster_enabled_var.get() else 'OFF'}",
             f"Account roster locked: {len(self.account_roster_user_ids)} account(s)",
+            f"Identity conflicts (active total): {conflict_total}",
+            f"Identity retries attempted (active total): {retry_total}",
+            f"Identity session pins active: {pinned_total}",
             f"Instance health alerts: {'ON' if self.health_alert_enabled_var.get() else 'OFF'} ({self.health_alert_minutes_var.get().strip() or '3'} min)",
             f"Recovery auto-save: {'ON' if self.autosave_enabled_var.get() else 'OFF'} ({self.autosave_minutes_var.get().strip() or '2'} min)",
             f"Recovery sequence: {'ON' if self.recovery_enabled_var.get() else 'OFF'}",
@@ -6955,11 +7806,20 @@ class AntiAfkApp:
             f"Rare biome confirm gate: {'ON' if self.rare_biome_confirm_enabled_var.get() else 'OFF'} ({self.rare_biome_confirm_seconds_var.get().strip() or '4'}s)",
             f"Rare biome action: {self.biome_action_var.get()} ({self.biome_action_preset_var.get().strip() or 'default'})",
             f"Vendor alerts: {'ON' if self.vendor_alerts_enabled_var.get() else 'OFF'} (cooldown={self.vendor_alert_cooldown_var.get().strip() or '180'}s)",
+            f"Rules mode: {'ON' if self.rules_mode_enabled_var.get() else 'OFF'} (defs={len(self.rules_definitions)}, verbose={'ON' if self.rules_verbose_logging_var.get() else 'OFF'})",
+            f"Rules counters: matches={self.rules_total_matches}, actions={self.rules_total_actions}",
             f"Private server helper: place={self.private_server_place_id_var.get().strip() or '-'} code={'set' if self.private_server_code_var.get().strip() else 'empty'}",
             f"Latest release URL: {self.latest_release_url}",
             f"Singleton cleanup interval: {self.singleton_cleanup_attempt_interval_seconds:.0f}s, max attempts per PID: {self.singleton_cleanup_max_attempts_per_pid}",
             f"Session errors: {self.session_errors}",
         ]
+        if recent_conflicts:
+            checks.append("Recent identity conflict reasons:")
+            checks.extend(f"- {line}" for line in recent_conflicts)
+        if recent_trace:
+            checks.append("Recent relaunch decision trace:")
+            for item in recent_trace:
+                checks.append(f"- {item.get('timestamp', '-')}: {item.get('state', 'no-op')} | {item.get('reason', '-')}")
         body = "\n".join(checks)
         self.diagnostics_text.configure(state=tk.NORMAL)
         self.diagnostics_text.delete("1.0", tk.END)
@@ -6983,6 +7843,20 @@ class AntiAfkApp:
         app_log_tail = self.log_box.get("1.0", tk.END).splitlines()[-250:]
         biome_history = self.biome_history[-120:]
         recovery_history = self.recovery_timeline[-180:]
+        with self.state_lock:
+            identity_telemetry = {
+                str(pid): {
+                    "confidence": self.pid_identity_confidence.get(pid, "unknown"),
+                    "reason": self.pid_identity_reason.get(pid, ""),
+                    "conflict_count": self.pid_identity_conflict_count.get(pid, 0),
+                    "last_conflict_reason": self.pid_identity_last_conflict_reason.get(pid, ""),
+                    "retry_count": self.pid_identity_retry_count.get(pid, 0),
+                    "last_retry_at": self.pid_identity_last_retry_at.get(pid, 0.0),
+                    "session_pinned": pid in self.pid_identity_session_pins,
+                }
+                for pid in sorted({pid for _hwnd, _title, pid, _pname in self.window_map})
+            }
+            relaunch_trace = list(self.instance_relaunch_decision_trace[-180:])
 
         try:
             with zipfile.ZipFile(path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
@@ -6990,6 +7864,8 @@ class AntiAfkApp:
                 zf.writestr("stayactive-log-tail.txt", "\n".join(app_log_tail) + "\n")
                 zf.writestr("biome-history.txt", "\n".join(biome_history) + "\n")
                 zf.writestr("recovery-timeline.txt", "\n".join(recovery_history) + "\n")
+                zf.writestr("identity-telemetry.json", json.dumps(identity_telemetry, indent=2) + "\n")
+                zf.writestr("relaunch-decision-trace.json", json.dumps(relaunch_trace, indent=2) + "\n")
                 if os.path.exists(self.config_path):
                     zf.write(self.config_path, arcname="stayactive_config.json")
                 if os.path.exists(self.theme_config_path):
@@ -7059,6 +7935,12 @@ class AntiAfkApp:
                         "process": pname,
                         "username": self.pid_username.get(pid, ""),
                         "identity": self.pid_identity_confidence.get(pid, "unknown"),
+                        "identity_reason": self.pid_identity_reason.get(pid, ""),
+                        "identity_conflict_count": self.pid_identity_conflict_count.get(pid, 0),
+                        "identity_last_conflict_reason": self.pid_identity_last_conflict_reason.get(pid, ""),
+                        "identity_retry_count": self.pid_identity_retry_count.get(pid, 0),
+                        "identity_last_retry_at": self.pid_identity_last_retry_at.get(pid, 0.0),
+                        "identity_session_pinned": pid in self.pid_identity_session_pins,
                         "equipped_aura": self.pid_equipped_aura.get(pid, ""),
                         "last_jump": self.instance_last_jump.get(hwnd),
                         "priority": self.instance_priority_by_pid.get(pid, 1),
@@ -7091,6 +7973,12 @@ class AntiAfkApp:
                     "process",
                     "username",
                     "identity",
+                    "identity_reason",
+                    "identity_conflict_count",
+                    "identity_last_conflict_reason",
+                    "identity_retry_count",
+                    "identity_last_retry_at",
+                    "identity_session_pinned",
                     "equipped_aura",
                     "last_jump",
                     "priority",
@@ -7147,11 +8035,27 @@ class AntiAfkApp:
             self.run_diagnostics_checks()
             diagnostics_lines = self.diagnostics_text.get("1.0", tk.END).strip().splitlines()
             log_tail = self.log_box.get("1.0", tk.END).splitlines()[-140:]
+            with self.state_lock:
+                identity_telemetry = {
+                    str(pid): {
+                        "confidence": self.pid_identity_confidence.get(pid, "unknown"),
+                        "reason": self.pid_identity_reason.get(pid, ""),
+                        "conflict_count": self.pid_identity_conflict_count.get(pid, 0),
+                        "last_conflict_reason": self.pid_identity_last_conflict_reason.get(pid, ""),
+                        "retry_count": self.pid_identity_retry_count.get(pid, 0),
+                        "last_retry_at": self.pid_identity_last_retry_at.get(pid, 0.0),
+                        "session_pinned": pid in self.pid_identity_session_pins,
+                    }
+                    for pid in sorted({pid for _hwnd, _title, pid, _pname in self.window_map})
+                }
+                relaunch_trace = list(self.instance_relaunch_decision_trace[-180:])
             payload = {
                 "version": APP_VERSION,
                 "generated_at": datetime.now().isoformat(timespec="seconds"),
                 "diagnostics": diagnostics_lines,
                 "settings": self._collect_config_data(),
+                "identity_telemetry": identity_telemetry,
+                "relaunch_decision_trace": relaunch_trace,
                 "recent_events": self.event_timeline[-60:],
                 "recent_log_tail": log_tail,
             }
@@ -7287,7 +8191,7 @@ class AntiAfkApp:
                     code = getattr(resp, "status", 204)
                 elapsed_ms = int((time.perf_counter() - started) * 1000)
                 self._enqueue_on_ui_thread(
-                    messagebox.showinfo,
+                    messagebox.showerror,
                     "Webhook test",
                     f"Success (HTTP {code})\nLatency: {elapsed_ms} ms\nTarget: {url}",
                 )
