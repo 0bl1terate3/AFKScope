@@ -112,7 +112,7 @@ RELAUNCH_PLAYBOOKS: dict[str, dict[str, float | int]] = {
     "aggressive": {"grace_seconds": 20, "max_per_hour": 20, "cooldown_seconds": 10},
 }
 
-APP_VERSION = "0.1.7"
+APP_VERSION = "0.1.8"
 APP_CONFIG_VERSION = 3
 APP_NAME = "StayActive"
 APP_USER_AGENT = f"{APP_NAME}/{APP_VERSION}"
@@ -557,6 +557,46 @@ class AntiAfkApp:
         self.process_limiter_thread: threading.Thread | None = None
         self.process_limiter_stop_event = threading.Event()
 
+        # v0.1.8: Persistent identity pins
+        self.persistent_pins_path = os.path.join(self.data_dir, "stayactive_persistent_pins.json")
+        self.persistent_pins_enabled_var = tk.BooleanVar(value=False)
+        self.persistent_identity_pins: dict[str, dict[str, Any]] = {}
+        self._load_persistent_pins()
+
+        # v0.1.8: Instance aliasing
+        self.instance_aliases: dict[int, str] = {}
+        self.instance_alias_by_username: dict[str, str] = {}
+
+        # v0.1.8: Per-account performance profiles
+        self.per_account_limiter_profiles: dict[str, dict[str, Any]] = {}
+        self.smart_freeze_enabled_var = tk.BooleanVar(value=False)
+        self.runtime_smart_freeze_enabled = False
+        self.smart_freeze_last_fg_pid: int | None = None
+
+        # v0.1.8: Roblox error screen detection
+        self.error_screen_detection_enabled_var = tk.BooleanVar(value=False)
+        self.runtime_error_screen_detection_enabled = False
+        self.error_screen_last_check_at: dict[int, float] = {}
+        self.error_screen_detected_pids: set[int] = set()
+
+        # v0.1.8: Session analytics
+        self.session_analytics_events: list[dict[str, Any]] = []
+        self.max_analytics_events = 2000
+        self.analytics_session_start = time.time()
+
+        # v0.1.8: Discord Rich Presence
+        self.discord_rpc_enabled_var = tk.BooleanVar(value=False)
+        self.runtime_discord_rpc_enabled = False
+        self.discord_rpc_pipe: Any = None
+        self.discord_rpc_last_update_at = 0.0
+        self.discord_rpc_client_id = "1312345678901234567"
+
+        # v0.1.8: In-app seamless updating
+        self.seamless_update_in_progress = False
+
+        # v0.1.8: Relaunch webhook URL
+        self.webhook_relaunch_url_var = tk.StringVar(value="")
+
         self.current_theme_name = "Midnight"
         self.theme_palettes: dict[str, dict[str, str]] = {
             "Midnight": {"bg": "#171a1f", "panel": "#1f2430", "field": "#232a36", "text": "#e7ecf3", "muted": "#aeb8c8", "accent": "#7cb0ff", "tree_sel": "#355a93", "tree_selfg": "#ffffff"},
@@ -715,14 +755,728 @@ class AntiAfkApp:
         self.root.after(25, self._drain_ui_dispatch_queue)
         self.root.after(50, self._finish_startup)
 
+    # ── v0.1.8: Persistent Identity Pins ──────────────────────────────────
+
+    def _load_persistent_pins(self) -> None:
+        if not os.path.exists(self.persistent_pins_path):
+            return
+        try:
+            with open(self.persistent_pins_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, dict):
+                self.persistent_identity_pins = data
+        except Exception:
+            self.persistent_identity_pins = {}
+
+    def _save_persistent_pins(self) -> None:
+        try:
+            self._atomic_write_json(self.persistent_pins_path, self.persistent_identity_pins)
+        except Exception as exc:
+            self.log(f"Failed to save persistent pins: {exc}")
+
+    def _apply_persistent_pins_to_session(self) -> None:
+        if not self.persistent_pins_enabled_var.get() or not self.persistent_identity_pins:
+            return
+        with self.state_lock:
+            for _hwnd, _title, pid, _pname in self.window_map:
+                if pid in self.pid_identity_session_pins:
+                    continue
+                mac = self._get_process_mac_key(pid)
+                if mac and mac in self.persistent_identity_pins:
+                    pin_data = self.persistent_identity_pins[mac]
+                    if isinstance(pin_data, dict):
+                        self.pid_identity_session_pins[pid] = dict(pin_data)
+
+    def _get_process_mac_key(self, pid: int) -> str:
+        try:
+            username = self.pid_username.get(pid, "")
+            user_id = self.pid_user_id.get(pid)
+            if not username and not user_id:
+                return ""
+            return f"{username.lower()}:{user_id or 0}"
+        except Exception:
+            return ""
+
+    def persist_current_pins(self) -> None:
+        with self.state_lock:
+            for pid, pin in self.pid_identity_session_pins.items():
+                if not isinstance(pin, dict):
+                    continue
+                mac = self._get_process_mac_key(pid)
+                if mac:
+                    self.persistent_identity_pins[mac] = dict(pin)
+        self._save_persistent_pins()
+        count = len(self.persistent_identity_pins)
+        self.log(f"Persisted {count} identity pin(s) to disk.")
+        self._record_event(f"Persistent pins saved ({count})")
+
+    def clear_persistent_pins(self) -> None:
+        self.persistent_identity_pins.clear()
+        self._save_persistent_pins()
+        self.log("Cleared all persistent identity pins.")
+        self._record_event("Persistent pins cleared")
+
+    # ── v0.1.8: Instance Aliasing ──────────────────────────────────────
+
+    def _get_instance_display_name(self, pid: int, pname: str, hwnd: int) -> str:
+        username = self.pid_username.get(pid, "")
+        if username and username.lower() in self.instance_alias_by_username:
+            return self.instance_alias_by_username[username.lower()]
+        if pid in self.instance_aliases:
+            return self.instance_aliases[pid]
+        return ""
+
+    def rename_instance(self, hwnd: int) -> None:
+        pid = None
+        with self.state_lock:
+            for h, _t, p, _pn in self.window_map:
+                if h == hwnd:
+                    pid = p
+                    break
+        if pid is None:
+            return
+        username = self.pid_username.get(pid, "")
+        current_alias = self._get_instance_display_name(pid, "", hwnd)
+        dialog = tk.Toplevel(self.root)
+        dialog.title("Rename Instance")
+        dialog.geometry("380x140")
+        dialog.transient(self.root)
+        dialog.grab_set()
+        ttk.Label(dialog, text=f"PID {pid} | {username or 'Unknown'}").pack(pady=(10, 4))
+        ttk.Label(dialog, text="Alias:").pack(anchor="w", padx=20)
+        alias_var = tk.StringVar(value=current_alias)
+        entry = ttk.Entry(dialog, textvariable=alias_var, width=36)
+        entry.pack(padx=20, pady=4)
+        entry.focus_set()
+
+        def _apply() -> None:
+            alias = alias_var.get().strip()[:48]
+            if alias:
+                self.instance_aliases[pid] = alias
+                if username:
+                    self.instance_alias_by_username[username.lower()] = alias
+            else:
+                self.instance_aliases.pop(pid, None)
+                if username:
+                    self.instance_alias_by_username.pop(username.lower(), None)
+            dialog.destroy()
+            self.refresh_instance_list(manual=False)
+            self.log(f"Instance PID {pid} alias set to '{alias or '(cleared)'}' .")
+
+        ttk.Button(dialog, text="Apply", command=_apply).pack(side=tk.LEFT, padx=(20, 4), pady=8)
+        ttk.Button(dialog, text="Cancel", command=dialog.destroy).pack(side=tk.LEFT, pady=8)
+
+    # ── v0.1.8: Per-Account Performance Profiles ──────────────────────
+
+    def _get_account_limiter_profile(self, pid: int) -> dict[str, Any] | None:
+        username = self.pid_username.get(pid, "").lower()
+        if username and username in self.per_account_limiter_profiles:
+            return self.per_account_limiter_profiles[username]
+        return None
+
+    def open_per_account_limiter_editor(self) -> None:
+        dialog = tk.Toplevel(self.root)
+        dialog.title("Per-Account Performance Profiles")
+        dialog.geometry("620x420")
+        dialog.transient(self.root)
+        dialog.grab_set()
+        ttk.Label(dialog, text="Set per-account duty cycle targets. Leave blank to use global settings.", wraplength=580).pack(pady=(10, 6), padx=10)
+        tree_frame = ttk.Frame(dialog)
+        tree_frame.pack(fill="both", expand=True, padx=10, pady=4)
+        cols = ("username", "target_percent", "auto_freeze", "alias")
+        tree = ttk.Treeview(tree_frame, columns=cols, show="headings", height=10)
+        tree.heading("username", text="Username")
+        tree.heading("target_percent", text="Target %")
+        tree.heading("auto_freeze", text="Auto Freeze")
+        tree.heading("alias", text="Alias")
+        tree.column("username", width=150)
+        tree.column("target_percent", width=100, anchor="center")
+        tree.column("auto_freeze", width=100, anchor="center")
+        tree.column("alias", width=200)
+        tree.pack(fill="both", expand=True)
+        with self.state_lock:
+            usernames = sorted({self.pid_username.get(pid, "").lower() for _h, _t, pid, _p in self.window_map if self.pid_username.get(pid)})
+        for uname in usernames:
+            profile = self.per_account_limiter_profiles.get(uname, {})
+            alias = self.instance_alias_by_username.get(uname, "")
+            tree.insert("", tk.END, values=(
+                uname,
+                str(profile.get("target_percent", "")),
+                "Yes" if profile.get("auto_freeze") else "No",
+                alias,
+            ))
+
+        edit_frame = ttk.LabelFrame(dialog, text="Edit Selected", padding=8)
+        edit_frame.pack(fill="x", padx=10, pady=6)
+        ttk.Label(edit_frame, text="Target %:").pack(side=tk.LEFT)
+        target_var = tk.StringVar(value="40")
+        ttk.Entry(edit_frame, textvariable=target_var, width=6).pack(side=tk.LEFT, padx=(4, 10))
+        freeze_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(edit_frame, text="Auto Freeze", variable=freeze_var).pack(side=tk.LEFT, padx=(0, 10))
+
+        def _apply_selected() -> None:
+            sel = tree.selection()
+            if not sel:
+                return
+            for item in sel:
+                vals = tree.item(item, "values")
+                uname = str(vals[0]).lower()
+                try:
+                    pct = int(target_var.get().strip())
+                    pct = max(0, min(100, pct))
+                except ValueError:
+                    pct = 40
+                self.per_account_limiter_profiles[uname] = {
+                    "target_percent": pct,
+                    "auto_freeze": freeze_var.get(),
+                }
+                tree.item(item, values=(uname, str(pct), "Yes" if freeze_var.get() else "No", vals[3]))
+            self.log("Per-account limiter profiles updated.")
+
+        ttk.Button(edit_frame, text="Apply", command=_apply_selected).pack(side=tk.LEFT, padx=(0, 6))
+        ttk.Button(dialog, text="Close", command=dialog.destroy).pack(pady=(0, 8))
+
+    # ── v0.1.8: Smart Freeze (Active Window Detection) ────────────────
+
+    def _smart_freeze_tick(self) -> None:
+        if not self.runtime_smart_freeze_enabled or not self.process_limiter_supported:
+            return
+        try:
+            fg_hwnd = self.user32.GetForegroundWindow()
+            fg_pid = wintypes.DWORD(0)
+            self.user32.GetWindowThreadProcessId(fg_hwnd, ctypes.byref(fg_pid))
+            fg_pid_val = fg_pid.value
+        except Exception:
+            return
+        with self.state_lock:
+            roblox_pids = {pid for _h, _t, pid, _p in self.window_map}
+        if fg_pid_val in roblox_pids:
+            if fg_pid_val != self.smart_freeze_last_fg_pid:
+                self.process_limiter_boost_until_by_pid[fg_pid_val] = time.time() + 86400
+                if self.smart_freeze_last_fg_pid and self.smart_freeze_last_fg_pid in roblox_pids:
+                    self.process_limiter_boost_until_by_pid.pop(self.smart_freeze_last_fg_pid, None)
+                self.smart_freeze_last_fg_pid = fg_pid_val
+        else:
+            if self.smart_freeze_last_fg_pid and self.smart_freeze_last_fg_pid in roblox_pids:
+                self.process_limiter_boost_until_by_pid.pop(self.smart_freeze_last_fg_pid, None)
+            self.smart_freeze_last_fg_pid = None
+
+    # ── v0.1.8: Roblox Error Screen Detection ─────────────────────────
+
+    def _check_roblox_error_screens(self) -> None:
+        if not self.runtime_error_screen_detection_enabled:
+            return
+        now = time.time()
+        with self.state_lock:
+            targets = [(hwnd, pid) for hwnd, _t, pid, _p in self.window_map]
+        for hwnd, pid in targets:
+            if (now - self.error_screen_last_check_at.get(pid, 0)) < 5.0:
+                continue
+            self.error_screen_last_check_at[pid] = now
+            try:
+                title_buf = ctypes.create_unicode_buffer(256)
+                self.user32.GetWindowTextW(hwnd, title_buf, 256)
+                title = title_buf.value.lower()
+                is_error = any(marker in title for marker in (
+                    "error", "disconnected", "connection lost",
+                    "roblox crash", "unexpected error",
+                ))
+                if not is_error:
+                    child_hwnd = ctypes.c_void_p(0)
+                    try:
+                        find_window_ex = self.user32.FindWindowExW
+                        find_window_ex.argtypes = [wintypes.HWND, wintypes.HWND, wintypes.LPCWSTR, wintypes.LPCWSTR]
+                        find_window_ex.restype = wintypes.HWND
+                        child_hwnd = find_window_ex(hwnd, None, None, None)
+                        if child_hwnd:
+                            child_buf = ctypes.create_unicode_buffer(512)
+                            self.user32.GetWindowTextW(child_hwnd, child_buf, 512)
+                            child_text = child_buf.value.lower()
+                            is_error = any(code in child_text for code in (
+                                "error code: 277", "error code: 268",
+                                "error code: 279", "error code: 264",
+                                "disconnected", "lost connection",
+                                "same account launched",
+                            ))
+                    except Exception:
+                        pass
+                if is_error and pid not in self.error_screen_detected_pids:
+                    self.error_screen_detected_pids.add(pid)
+                    username = self.pid_username.get(pid, f"PID {pid}")
+                    self.log(f"Error screen detected on {username} (PID {pid}). Terminating for relaunch.")
+                    self._record_event(f"Error screen detected: {username}")
+                    self._emit_event(
+                        event_type="instance.error_screen",
+                        category="watchdog",
+                        severity="warning",
+                        source="error-detection",
+                        message=f"Roblox error screen detected on {username}",
+                        payload={"pid": pid, "hwnd": hwnd, "username": username},
+                    )
+                    self._send_webhook(
+                        f"{APP_NAME} Error Screen Detected",
+                        f"Error screen detected on {username} (PID {pid}). Forcing termination for relaunch.",
+                        channel="recovery",
+                    )
+                    try:
+                        subprocess.run(
+                            ["taskkill", "/F", "/PID", str(pid)],
+                            capture_output=True,
+                            creationflags=subprocess.CREATE_NO_WINDOW,
+                        )
+                    except Exception as exc:
+                        self.log(f"Failed to terminate error-screen instance PID {pid}: {exc}")
+                elif not is_error:
+                    self.error_screen_detected_pids.discard(pid)
+            except Exception:
+                pass
+
+    # ── v0.1.8: Session Analytics ──────────────────────────────────────
+
+    def _record_analytics_event(self, event_type: str, details: dict[str, Any] | None = None) -> None:
+        entry = {
+            "timestamp": time.time(),
+            "iso": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            "type": event_type,
+            "details": dict(details) if details else {},
+        }
+        self.session_analytics_events.append(entry)
+        self.session_analytics_events = self.session_analytics_events[-self.max_analytics_events:]
+
+    def _build_analytics_tab(self, parent: ttk.Frame) -> None:
+        ttk.Label(parent, text="Session Analytics (last 24h)", font=("Segoe UI", 11, "bold")).pack(anchor="w", pady=(0, 6))
+        summary_frame = ttk.LabelFrame(parent, text="Session Summary", padding=8)
+        summary_frame.pack(fill="x", pady=(0, 8))
+        self.analytics_summary_var = tk.StringVar(value="No data yet.")
+        ttk.Label(summary_frame, textvariable=self.analytics_summary_var, wraplength=980).pack(anchor="w")
+        ttk.Button(summary_frame, text="Refresh Analytics", command=self._refresh_analytics_display).pack(anchor="w", pady=(6, 0))
+
+        timeline_frame = ttk.LabelFrame(parent, text="Event Timeline", padding=8)
+        timeline_frame.pack(fill="both", expand=True)
+        self.analytics_timeline_list = tk.Listbox(timeline_frame, height=16, font=("Consolas", 8))
+        analytics_scroll = ttk.Scrollbar(timeline_frame, orient=tk.VERTICAL, command=self.analytics_timeline_list.yview)
+        self.analytics_timeline_list.configure(yscrollcommand=analytics_scroll.set)
+        self.analytics_timeline_list.pack(side=tk.LEFT, fill="both", expand=True)
+        analytics_scroll.pack(side=tk.RIGHT, fill="y")
+
+        graph_frame = ttk.LabelFrame(parent, text="Uptime Graph (last 24h)", padding=8)
+        graph_frame.pack(fill="x", pady=(8, 0))
+        self.analytics_canvas = tk.Canvas(graph_frame, height=80, bg="#1a1a2e")
+        self.analytics_canvas.pack(fill="x")
+
+    def _refresh_analytics_display(self) -> None:
+        now = time.time()
+        cutoff = now - 86400
+        recent = [e for e in self.session_analytics_events if e.get("timestamp", 0) >= cutoff]
+        uptime_seconds = int(now - self.analytics_session_start)
+        hours, remainder = divmod(uptime_seconds, 3600)
+        minutes, seconds = divmod(remainder, 60)
+        biome_events = [e for e in recent if e.get("type") == "biome_change"]
+        crash_events = [e for e in recent if e.get("type") in ("instance_crash", "instance_relaunch", "error_screen")]
+        jump_events = [e for e in recent if e.get("type") == "jump_cycle"]
+        self.analytics_summary_var.set(
+            f"Session uptime: {hours}h {minutes}m {seconds}s | "
+            f"Biome changes: {len(biome_events)} | "
+            f"Crashes/Relaunches: {len(crash_events)} | "
+            f"Jump cycles: {len(jump_events)} | "
+            f"Total events: {len(recent)}"
+        )
+        self.analytics_timeline_list.delete(0, tk.END)
+        for event in reversed(recent[-100:]):
+            ts = event.get("timestamp", 0)
+            iso = time.strftime("%H:%M:%S", time.localtime(ts))
+            etype = event.get("type", "unknown")
+            details = event.get("details", {})
+            msg = details.get("message", "")
+            self.analytics_timeline_list.insert(tk.END, f"{iso} | {etype} | {msg}")
+        self._draw_analytics_graph(recent, cutoff, now)
+
+    def _draw_analytics_graph(self, events: list[dict[str, Any]], start: float, end: float) -> None:
+        canvas = self.analytics_canvas
+        canvas.delete("all")
+        w = canvas.winfo_width() or 800
+        h = 80
+        if w < 50:
+            w = 800
+        duration = max(1, end - start)
+        canvas.create_line(0, h - 1, w, h - 1, fill="#333355")
+        for i in range(0, 25, 6):
+            x = int((i / 24) * w)
+            canvas.create_line(x, 0, x, h, fill="#222244")
+            canvas.create_text(x + 2, h - 12, text=f"-{24 - i}h", fill="#666688", anchor="w", font=("Segoe UI", 7))
+        for event in events:
+            ts = event.get("timestamp", 0)
+            x = int(((ts - start) / duration) * w)
+            etype = event.get("type", "")
+            if etype == "biome_change":
+                canvas.create_oval(x - 2, 10, x + 2, 14, fill="#42FF73", outline="")
+            elif etype in ("instance_crash", "error_screen"):
+                canvas.create_oval(x - 3, 20, x + 3, 26, fill="#FF4444", outline="")
+            elif etype == "instance_relaunch":
+                canvas.create_oval(x - 2, 30, x + 2, 34, fill="#FFB020", outline="")
+            elif etype == "jump_cycle":
+                canvas.create_line(x, 50, x, 55, fill="#4FC3F7")
+        canvas.create_rectangle(0, 60, int(((end - self.analytics_session_start) / duration) * w), 70, fill="#2ea3ff", outline="")
+
+    # ── v0.1.8: Discord Rich Presence ──────────────────────────────────
+
+    def _discord_rpc_connect(self) -> bool:
+        if self.discord_rpc_pipe is not None:
+            return True
+        try:
+            pipe_path = r"\\.\pipe\discord-ipc-0"
+            pipe = open(pipe_path, "r+b")
+            self.discord_rpc_pipe = pipe
+            handshake = json.dumps({"v": 1, "client_id": self.discord_rpc_client_id}).encode("utf-8")
+            header = struct.pack("<II", 0, len(handshake))
+            pipe.write(header + handshake)
+            pipe.flush()
+            pipe.read(2048)
+            return True
+        except Exception:
+            self.discord_rpc_pipe = None
+            return False
+
+    def _discord_rpc_update(self) -> None:
+        if not self.runtime_discord_rpc_enabled:
+            return
+        now = time.time()
+        if (now - self.discord_rpc_last_update_at) < 15.0:
+            return
+        self.discord_rpc_last_update_at = now
+        if not self._discord_rpc_connect():
+            return
+        with self.state_lock:
+            instance_count = len(self.window_map)
+        uptime_seconds = int(now - (self.session_started_at or self.analytics_session_start))
+        hours, remainder = divmod(uptime_seconds, 3600)
+        minutes, _ = divmod(remainder, 60)
+        state_text = f"Running {instance_count} Account{'s' if instance_count != 1 else ''}"
+        details_text = f"{hours}h {minutes}m Session Uptime"
+        payload = json.dumps({
+            "cmd": "SET_ACTIVITY",
+            "args": {
+                "pid": os.getpid(),
+                "activity": {
+                    "state": state_text,
+                    "details": details_text,
+                    "timestamps": {"start": int(self.analytics_session_start)},
+                    "assets": {
+                        "large_image": "stayactive_icon",
+                        "large_text": f"{APP_NAME} v{APP_VERSION}",
+                    },
+                },
+            },
+            "nonce": str(random.randint(100000, 999999)),
+        }).encode("utf-8")
+        try:
+            header = struct.pack("<II", 1, len(payload))
+            self.discord_rpc_pipe.write(header + payload)
+            self.discord_rpc_pipe.flush()
+        except Exception:
+            try:
+                self.discord_rpc_pipe.close()
+            except Exception:
+                pass
+            self.discord_rpc_pipe = None
+
+    def _discord_rpc_disconnect(self) -> None:
+        if self.discord_rpc_pipe is not None:
+            try:
+                self.discord_rpc_pipe.close()
+            except Exception:
+                pass
+            self.discord_rpc_pipe = None
+
+    # ── v0.1.8: In-App Seamless Updating ──────────────────────────────
+
+    def seamless_update_and_restart(self) -> None:
+        if self.seamless_update_in_progress:
+            self.log("Seamless update already in progress.")
+            return
+        if not self.latest_release_asset_url:
+            messagebox.showinfo("Update", "No update asset URL available. Check for updates first.")
+            return
+        self.seamless_update_in_progress = True
+        self.log("Starting seamless update...")
+        self._record_event("Seamless update started")
+        threading.Thread(target=self._seamless_update_worker, daemon=True).start()
+
+    def _seamless_update_worker(self) -> None:
+        try:
+            url = self.latest_release_asset_url
+            asset_name = self.latest_release_asset_name or "StayActive.exe"
+            current_exe = sys.executable if getattr(sys, "frozen", False) else ""
+            if not current_exe or not current_exe.lower().endswith(".exe"):
+                self._enqueue_on_ui_thread(
+                    messagebox.showinfo,
+                    "Update",
+                    "Seamless update only works with the compiled .exe build. Use Download Latest instead.",
+                )
+                self.seamless_update_in_progress = False
+                return
+            self._enqueue_on_ui_thread(self.log, f"Downloading {asset_name}...")
+            req = urlrequest.Request(url, headers={"User-Agent": APP_USER_AGENT})
+            with urlrequest.urlopen(req, timeout=120) as resp:
+                data = resp.read()
+            if len(data) < 1_000_000:
+                self._enqueue_on_ui_thread(self.log, "Download too small, aborting update.")
+                self.seamless_update_in_progress = False
+                return
+            backup_path = current_exe + ".bak"
+            new_path = current_exe + ".new"
+            with open(new_path, "wb") as f:
+                f.write(data)
+            try:
+                if os.path.exists(backup_path):
+                    os.remove(backup_path)
+                os.rename(current_exe, backup_path)
+                os.rename(new_path, current_exe)
+            except Exception as exc:
+                try:
+                    if not os.path.exists(current_exe) and os.path.exists(backup_path):
+                        os.rename(backup_path, current_exe)
+                except Exception:
+                    pass
+                self._enqueue_on_ui_thread(self.log, f"Update file swap failed: {exc}")
+                self.seamless_update_in_progress = False
+                return
+            self._enqueue_on_ui_thread(self.log, "Update downloaded. Restarting...")
+            self._enqueue_on_ui_thread(self.save_config)
+            time.sleep(0.5)
+            subprocess.Popen([current_exe], close_fds=True)
+            self._enqueue_on_ui_thread(self.on_close)
+        except Exception as exc:
+            self._enqueue_on_ui_thread(self.log, f"Seamless update failed: {exc}")
+            self.seamless_update_in_progress = False
+
+    # ── v0.1.8: Visual Rule Builder ────────────────────────────────────
+
+    def open_visual_rule_builder(self) -> None:
+        dialog = tk.Toplevel(self.root)
+        dialog.title("Visual Rule Builder")
+        dialog.geometry("680x560")
+        dialog.transient(self.root)
+        dialog.grab_set()
+
+        ttk.Label(dialog, text="Create a New Rule", font=("Segoe UI", 12, "bold")).pack(pady=(10, 6))
+
+        # Rule ID
+        id_frame = ttk.Frame(dialog)
+        id_frame.pack(fill="x", padx=16, pady=2)
+        ttk.Label(id_frame, text="Rule ID:").pack(side=tk.LEFT)
+        rule_id_var = tk.StringVar(value=f"rule_{len(self.rules_definitions) + 1}")
+        ttk.Entry(id_frame, textvariable=rule_id_var, width=24).pack(side=tk.LEFT, padx=(6, 0))
+        enabled_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(id_frame, text="Enabled", variable=enabled_var).pack(side=tk.LEFT, padx=(16, 0))
+
+        # Trigger
+        trigger_frame = ttk.LabelFrame(dialog, text="Trigger", padding=8)
+        trigger_frame.pack(fill="x", padx=16, pady=6)
+        ttk.Label(trigger_frame, text="Event type:").pack(side=tk.LEFT)
+        trigger_type_var = tk.StringVar(value="biome.change")
+        trigger_types = [
+            "biome.change", "instance.crash", "instance.error_screen",
+            "instance.relaunch", "watchdog.alert", "app.event",
+            "jump.success", "jump.failed", "vendor.alert",
+        ]
+        ttk.Combobox(trigger_frame, textvariable=trigger_type_var, values=trigger_types, width=22, state="readonly").pack(side=tk.LEFT, padx=(6, 12))
+        ttk.Label(trigger_frame, text="Contains:").pack(side=tk.LEFT)
+        trigger_contains_var = tk.StringVar(value="")
+        ttk.Entry(trigger_frame, textvariable=trigger_contains_var, width=20).pack(side=tk.LEFT, padx=(6, 0))
+
+        # Conditions with AND/OR
+        cond_frame = ttk.LabelFrame(dialog, text="Conditions", padding=8)
+        cond_frame.pack(fill="x", padx=16, pady=6)
+        cond_logic_var = tk.StringVar(value="AND")
+        ttk.Label(cond_frame, text="Logic:").pack(side=tk.LEFT)
+        ttk.Radiobutton(cond_frame, text="AND", variable=cond_logic_var, value="AND").pack(side=tk.LEFT, padx=(6, 4))
+        ttk.Radiobutton(cond_frame, text="OR", variable=cond_logic_var, value="OR").pack(side=tk.LEFT, padx=(0, 12))
+
+        cond_list_frame = ttk.Frame(cond_frame)
+        cond_list_frame.pack(fill="x", pady=(6, 0))
+        condition_entries: list[dict[str, tk.StringVar]] = []
+
+        def _add_condition_row() -> None:
+            row = ttk.Frame(cond_list_frame)
+            row.pack(fill="x", pady=2)
+            key_var = tk.StringVar(value="runtime_running")
+            val_var = tk.StringVar(value="true")
+            cond_keys = ["runtime_running", "payload_key", "contains", "equals", "not_equals"]
+            ttk.Combobox(row, textvariable=key_var, values=cond_keys, width=16, state="readonly").pack(side=tk.LEFT, padx=(0, 4))
+            ttk.Entry(row, textvariable=val_var, width=20).pack(side=tk.LEFT, padx=(0, 4))
+            condition_entries.append({"key": key_var, "value": val_var})
+
+        ttk.Button(cond_frame, text="+ Add Condition", command=_add_condition_row).pack(anchor="w", pady=(4, 0))
+
+        # Actions
+        action_frame = ttk.LabelFrame(dialog, text="Actions", padding=8)
+        action_frame.pack(fill="x", padx=16, pady=6)
+        action_entries: list[dict[str, tk.StringVar]] = []
+
+        def _add_action_row() -> None:
+            row = ttk.Frame(action_frame)
+            row.pack(fill="x", pady=2)
+            type_var = tk.StringVar(value="send_webhook")
+            action_types = [
+                "send_webhook", "load_preset", "pause", "resume",
+                "play_sound", "close_instance", "run_script",
+            ]
+            ttk.Combobox(row, textvariable=type_var, values=action_types, width=16, state="readonly").pack(side=tk.LEFT, padx=(0, 4))
+            param_var = tk.StringVar(value="")
+            ttk.Entry(row, textvariable=param_var, width=30).pack(side=tk.LEFT, padx=(0, 4))
+            ttk.Label(row, text="(param: preset name / sound / script path / minutes)").pack(side=tk.LEFT)
+            action_entries.append({"type": type_var, "param": param_var})
+
+        _add_action_row()
+        ttk.Button(action_frame, text="+ Add Action", command=_add_action_row).pack(anchor="w", pady=(4, 0))
+
+        # Cooldown/Debounce
+        timing_frame = ttk.Frame(dialog)
+        timing_frame.pack(fill="x", padx=16, pady=6)
+        ttk.Label(timing_frame, text="Cooldown (s):").pack(side=tk.LEFT)
+        cooldown_var = tk.StringVar(value="30")
+        ttk.Entry(timing_frame, textvariable=cooldown_var, width=6).pack(side=tk.LEFT, padx=(4, 12))
+        ttk.Label(timing_frame, text="Debounce (s):").pack(side=tk.LEFT)
+        debounce_var = tk.StringVar(value="5")
+        ttk.Entry(timing_frame, textvariable=debounce_var, width=6).pack(side=tk.LEFT, padx=(4, 0))
+
+        def _save_rule() -> None:
+            rule_id = rule_id_var.get().strip() or f"rule_{len(self.rules_definitions) + 1}"
+            trigger: dict[str, Any] = {"type": trigger_type_var.get().strip()}
+            contains = trigger_contains_var.get().strip()
+            if contains:
+                trigger["contains"] = contains
+
+            condition: dict[str, Any] = {}
+            if condition_entries:
+                if cond_logic_var.get() == "OR":
+                    or_conditions = []
+                    for entry in condition_entries:
+                        k = entry["key"].get().strip()
+                        v = entry["value"].get().strip()
+                        if k:
+                            sub = {}
+                            if k == "runtime_running":
+                                sub["runtime_running"] = v.lower() in ("true", "1", "yes")
+                            elif k == "contains":
+                                sub["contains"] = v
+                            else:
+                                sub["payload_key"] = k
+                                sub["equals"] = v
+                            or_conditions.append(sub)
+                    condition["or"] = or_conditions
+                else:
+                    for entry in condition_entries:
+                        k = entry["key"].get().strip()
+                        v = entry["value"].get().strip()
+                        if k:
+                            if k == "runtime_running":
+                                condition["runtime_running"] = v.lower() in ("true", "1", "yes")
+                            elif k == "contains":
+                                condition["contains"] = v
+                            else:
+                                condition["payload_key"] = k
+                                condition["equals"] = v
+
+            actions: list[dict[str, Any]] = []
+            for entry in action_entries:
+                atype = entry["type"].get().strip()
+                param = entry["param"].get().strip()
+                action: dict[str, Any] = {"type": atype}
+                if atype == "load_preset":
+                    action["preset"] = param or "default"
+                elif atype == "pause":
+                    try:
+                        action["minutes"] = int(param) if param else 5
+                    except ValueError:
+                        action["minutes"] = 5
+                elif atype == "play_sound":
+                    action["sound"] = param or "SystemExclamation"
+                elif atype == "run_script":
+                    action["script"] = param
+                elif atype == "send_webhook":
+                    action["description"] = param or "Rule triggered."
+                elif atype == "close_instance":
+                    action["target"] = param or "self"
+                actions.append(action)
+
+            try:
+                cd = float(cooldown_var.get().strip())
+            except ValueError:
+                cd = 30.0
+            try:
+                db = float(debounce_var.get().strip())
+            except ValueError:
+                db = 5.0
+
+            new_rule = {
+                "id": rule_id,
+                "enabled": enabled_var.get(),
+                "trigger": trigger,
+                "condition": condition,
+                "actions": actions,
+                "cooldown_seconds": max(0, cd),
+                "debounce_seconds": max(0, db),
+            }
+            validated = self._validate_rule_definition(new_rule)
+            if validated is None:
+                messagebox.showerror("Rule Builder", "Invalid rule definition. Ensure trigger and at least one action are set.")
+                return
+            self.rules_definitions.append(validated)
+            self._refresh_rules_status()
+            self.log(f"Rule '{rule_id}' created via visual builder.")
+            self._record_event(f"Rule created: {rule_id}")
+            dialog.destroy()
+
+        btn_frame = ttk.Frame(dialog)
+        btn_frame.pack(fill="x", padx=16, pady=(6, 10))
+        ttk.Button(btn_frame, text="Save Rule", command=_save_rule).pack(side=tk.LEFT, padx=(0, 6))
+        ttk.Button(btn_frame, text="Cancel", command=dialog.destroy).pack(side=tk.LEFT)
+
+    def _on_notebook_tab_changed(self, event: tk.Event) -> None:
+        try:
+            notebook = event.widget
+            current_tab = notebook.select()
+            if current_tab:
+                frame = self.root.nametowidget(current_tab)
+                self._animate_frame_fade_in(frame)
+        except Exception:
+            pass
+            
+    def _animate_frame_fade_in(self, frame: tk.Widget) -> None:
+        try:
+            # We can't actually fade in ttk.Frame directly via alpha, but we can 
+            # simulate a slide-in or just ensure it's refreshed. 
+            # For a true fade we'd need a canvas or toplevel, so we'll do a subtle 
+            # position shift animation if it's supported, otherwise just update.
+            frame.update_idletasks()
+        except Exception:
+            pass
+
     def _ensure_window_visible(self) -> None:
         # Force the main window to appear in front if Windows restores it hidden/off-screen.
         try:
             self._repair_main_window_if_needed(force=True, reason="startup")
             self.root.attributes("-topmost", True)
+            self._animate_window_fade_in()
             self.root.after(250, lambda: self.root.attributes("-topmost", False))
         except Exception:
             pass
+
+    def _animate_window_fade_in(self) -> None:
+        try:
+            self.root.attributes("-alpha", 0.0)
+            def fade_step(current_alpha: float) -> None:
+                current_alpha += 0.08
+                if current_alpha >= 1.0:
+                    self.root.attributes("-alpha", 1.0)
+                else:
+                    self.root.attributes("-alpha", current_alpha)
+                    self.root.after(16, fade_step, current_alpha)
+            fade_step(0.0)
+        except Exception:
+            self.root.attributes("-alpha", 1.0)
 
     @staticmethod
     def _parse_geometry_size(geometry: str) -> tuple[int, int] | None:
@@ -828,6 +1582,8 @@ class AntiAfkApp:
             self._schedule_instance_poll()
             self._schedule_recovery_autosave()
             self._apply_startup_restore()
+            # v0.1.8: Load persistent pins on startup
+            self._load_persistent_pins()
             self.root.after(2200, self._start_background_update_check)
             if self.recovery_prompt_needed:
                 self.log("Detected previous unclean shutdown state.")
@@ -960,17 +1716,21 @@ class AntiAfkApp:
 
         notebook = ttk.Notebook(container)
         notebook.pack(fill="both", expand=True)
+        notebook.bind("<<NotebookTabChanged>>", self._on_notebook_tab_changed)
 
         tab_control = ttk.Frame(notebook, padding=10)
         tab_instances = ttk.Frame(notebook, padding=10)
         tab_performance = ttk.Frame(notebook, padding=10)
         tab_monitor = ttk.Frame(notebook, padding=10)
+        tab_analytics = ttk.Frame(notebook, padding=10)
         tab_log = ttk.Frame(notebook, padding=10)
         notebook.add(tab_control, text="Dashboard")
         notebook.add(tab_instances, text="Instances")
         notebook.add(tab_performance, text="Performance")
         notebook.add(tab_monitor, text="Health & Diagnostics")
+        notebook.add(tab_analytics, text="Analytics")
         notebook.add(tab_log, text="Live Log")
+        self._build_analytics_tab(tab_analytics)
 
         action_bar = ttk.LabelFrame(tab_control, text="Action Bar", padding=8)
         action_bar.pack(fill="x", pady=(0, 8))
@@ -1012,6 +1772,7 @@ class AntiAfkApp:
         ttk.Button(qa_actions, text="Run Diagnostics", width=14, command=self.run_diagnostics_checks).pack(side=tk.LEFT, padx=(6, 0))
         ttk.Button(qa_actions, text="Check Updates", command=self.check_for_updates).pack(side=tk.LEFT, padx=(6, 0))
         ttk.Button(qa_actions, text="Download Latest", command=self.download_latest_release_asset).pack(side=tk.LEFT, padx=(6, 0))
+        ttk.Button(qa_actions, text="Update & Restart", command=self.seamless_update_and_restart).pack(side=tk.LEFT, padx=(6, 0))
 
         controls_group = ttk.LabelFrame(dash_run, text="Core Runtime", padding=10)
         controls_group.pack(fill="x")
@@ -1170,7 +1931,7 @@ class AntiAfkApp:
         ttk.Button(pause_quick_row, text="Pause Now", width=10, command=self.pause_for_minutes).pack(side=tk.LEFT)
         ttk.Button(pause_quick_row, text="Resume", width=10, command=self.clear_manual_pause).pack(side=tk.LEFT, padx=(6, 0))
 
-        rules_group = ttk.LabelFrame(dash_automation, text="Rules (MVP)", padding=10)
+        rules_group = ttk.LabelFrame(dash_automation, text="Rules Engine", padding=10)
         rules_group.pack(fill="x", pady=(8, 0))
         rules_top = ttk.Frame(rules_group)
         rules_top.pack(fill="x")
@@ -1185,10 +1946,21 @@ class AntiAfkApp:
             text="Verbose rule logs",
             variable=self.rules_verbose_logging_var,
         ).pack(side=tk.LEFT, padx=(10, 0))
+        ttk.Button(rules_top, text="Add Rule", width=10, command=self.open_visual_rule_builder).pack(side=tk.LEFT, padx=(10, 0))
         ttk.Label(rules_top, textvariable=self.rules_status_var).pack(side=tk.RIGHT)
         ttk.Label(rules_group, textvariable=self.rules_last_match_var).pack(anchor="w", pady=(6, 0))
         self.rules_history_list = tk.Listbox(rules_group, height=4)
         self.rules_history_list.pack(fill="x", pady=(4, 0))
+
+        error_detect_group = ttk.LabelFrame(dash_automation, text="Error Screen Detection", padding=10)
+        error_detect_group.pack(fill="x", pady=(8, 0))
+        error_detect_row = ttk.Frame(error_detect_group)
+        error_detect_row.pack(fill="x")
+        ttk.Checkbutton(
+            error_detect_row,
+            text="Detect Roblox error screens (277/268/279/264) and auto-terminate for relaunch",
+            variable=self.error_screen_detection_enabled_var,
+        ).pack(side=tk.LEFT)
 
         webhook_group = ttk.LabelFrame(dash_alerts, text="Webhook Alerts", padding=10)
         webhook_group.pack(fill="x")
@@ -1217,6 +1989,22 @@ class AntiAfkApp:
         ttk.Entry(route_row_2, textvariable=self.webhook_vendor_url_var, width=30).pack(
             side=tk.LEFT, padx=(6, 0), fill="x", expand=True
         )
+        route_row_3 = ttk.Frame(webhook_group)
+        route_row_3.pack(fill="x", pady=(6, 0))
+        ttk.Label(route_row_3, text="Relaunch URL").pack(side=tk.LEFT)
+        ttk.Entry(route_row_3, textvariable=self.webhook_relaunch_url_var, width=30).pack(
+            side=tk.LEFT, padx=(6, 10), fill="x", expand=True
+        )
+
+        discord_rpc_group = ttk.LabelFrame(dash_alerts, text="Discord Rich Presence", padding=10)
+        discord_rpc_group.pack(fill="x", pady=(8, 0))
+        discord_rpc_row = ttk.Frame(discord_rpc_group)
+        discord_rpc_row.pack(fill="x")
+        ttk.Checkbutton(
+            discord_rpc_row,
+            text="Enable Discord Rich Presence (shows account count & uptime on your Discord profile)",
+            variable=self.discord_rpc_enabled_var,
+        ).pack(side=tk.LEFT)
 
         health_group_controls = ttk.LabelFrame(dash_alerts, text="Instance Health Alerts", padding=10)
         health_group_controls.pack(fill="x", pady=(8, 0))
@@ -1472,7 +2260,20 @@ class AntiAfkApp:
         ttk.Button(identity_actions, text="Retry Identity", width=13, command=self.retry_selected_identity).pack(side=tk.LEFT, padx=(0, 4))
         ttk.Button(identity_actions, text="Clear Identity Cache", width=16, command=self.clear_selected_identity_cache).pack(side=tk.LEFT, padx=(0, 4))
         ttk.Button(identity_actions, text="Pin Session", width=11, command=self.pin_selected_identity_session).pack(side=tk.LEFT, padx=(0, 4))
-        ttk.Button(identity_actions, text="Unpin Session", width=11, command=self.unpin_selected_identity_session).pack(side=tk.LEFT)
+        ttk.Button(identity_actions, text="Unpin Session", width=11, command=self.unpin_selected_identity_session).pack(side=tk.LEFT, padx=(0, 4))
+        ttk.Button(identity_actions, text="Rename Instance", width=14, command=self._rename_selected_instance).pack(side=tk.LEFT, padx=(0, 4))
+
+        persistent_pins_group = ttk.LabelFrame(tab_instances, text="Identity Center (v0.1.8)", padding=8)
+        persistent_pins_group.pack(fill="x", pady=(8, 0))
+        pins_row = ttk.Frame(persistent_pins_group)
+        pins_row.pack(fill="x")
+        ttk.Checkbutton(
+            pins_row,
+            text="Persist identity pins across restarts",
+            variable=self.persistent_pins_enabled_var,
+        ).pack(side=tk.LEFT)
+        ttk.Button(pins_row, text="Save Pins to Disk", width=16, command=self.persist_current_pins).pack(side=tk.LEFT, padx=(10, 4))
+        ttk.Button(pins_row, text="Clear Saved Pins", width=14, command=self.clear_persistent_pins).pack(side=tk.LEFT)
 
         limiter_group = ttk.LabelFrame(tab_performance, text="Process Limiter", padding=10)
         limiter_group.pack(fill="x", pady=(0, 8))
@@ -1523,6 +2324,17 @@ class AntiAfkApp:
             command=self.resume_all_limited_processes,
         ).pack(side=tk.LEFT)
         ttk.Label(limiter_row2, textvariable=self.process_limiter_status_var).pack(side=tk.RIGHT)
+
+        smart_freeze_group = ttk.LabelFrame(tab_performance, text="Smart Freeze & Per-Account Profiles (v0.1.8)", padding=10)
+        smart_freeze_group.pack(fill="x", pady=(8, 0))
+        sf_row = ttk.Frame(smart_freeze_group)
+        sf_row.pack(fill="x")
+        ttk.Checkbutton(
+            sf_row,
+            text="Smart Freeze: auto-unfreeze active foreground Roblox window, freeze others",
+            variable=self.smart_freeze_enabled_var,
+        ).pack(side=tk.LEFT)
+        ttk.Button(sf_row, text="Per-Account Profiles", width=20, command=self.open_per_account_limiter_editor).pack(side=tk.LEFT, padx=(12, 0))
 
         limiter_note = ttk.LabelFrame(tab_performance, text="Notes", padding=10)
         limiter_note.pack(fill="x")
@@ -2139,11 +2951,47 @@ class AntiAfkApp:
             name = "Midnight"
             self.theme_name_var.set(name)
             palette = self.theme_palettes[name]
+            
+        old_palette = getattr(self, "current_palette", None)
         self.current_theme_name = name
         self.current_palette = dict(palette)
-        self._apply_theme(self.current_palette)
+        
+        if old_palette is not None and old_palette != self.current_palette:
+            self._animate_theme_transition(old_palette, self.current_palette)
+        else:
+            self._apply_theme(self.current_palette)
+            
         self.log(f"Theme applied: {name}")
         self._record_event(f"Theme: {name}")
+
+    def _animate_theme_transition(self, old_palette: dict[str, str], new_palette: dict[str, str], steps: int = 15, current_step: int = 0) -> None:
+        if current_step > steps:
+            self._apply_theme(new_palette)
+            return
+            
+        factor = current_step / steps
+        # Ease out cubic
+        factor = 1 - pow(1 - factor, 3)
+        
+        def _interp(c1: str, c2: str, f: float) -> str:
+            if not (c1.startswith("#") and len(c1) == 7 and c2.startswith("#") and len(c2) == 7):
+                return c2
+            try:
+                r1, g1, b1 = int(c1[1:3], 16), int(c1[3:5], 16), int(c1[5:7], 16)
+                r2, g2, b2 = int(c2[1:3], 16), int(c2[3:5], 16), int(c2[5:7], 16)
+                return f"#{int(r1 + (r2 - r1) * f):02x}{int(g1 + (g2 - g1) * f):02x}{int(b1 + (b2 - b1) * f):02x}"
+            except ValueError:
+                return c2
+                
+        interp_palette = {}
+        for k in new_palette:
+            if k in old_palette:
+                interp_palette[k] = _interp(old_palette[k], new_palette[k], factor)
+            else:
+                interp_palette[k] = new_palette[k]
+                
+        self._apply_theme(interp_palette)
+        self.root.after(16, self._animate_theme_transition, old_palette, new_palette, steps, current_step + 1)
 
     def _apply_theme(self, palette: dict[str, str]) -> None:
         try:
@@ -2156,12 +3004,35 @@ class AntiAfkApp:
         self.style.configure("TLabelframe", background=palette["bg"], foreground=palette["text"])
         self.style.configure("TLabelframe.Label", background=palette["bg"], foreground=palette["text"])
         self.style.configure("TLabel", background=palette["bg"], foreground=palette["text"])
-        self.style.configure("TButton", background=palette["panel"], foreground=palette["text"], borderwidth=1)
+        
+        # Enhanced button styling with better borders and padding
+        self.style.configure(
+            "TButton", 
+            background=palette["panel"], 
+            foreground=palette["text"], 
+            borderwidth=1,
+            relief="solid",
+            padding=(8, 4)
+        )
+        
+        # Add a subtle hover effect by computing a slightly lighter/darker shade of the panel color
+        panel_color = palette["panel"]
+        hover_color = palette["field"]
+        try:
+            r, g, b = int(panel_color[1:3], 16), int(panel_color[3:5], 16), int(panel_color[5:7], 16)
+            # Lighten the panel color slightly for hover state
+            hover_r, hover_g, hover_b = min(255, int(r * 1.15)), min(255, int(g * 1.15)), min(255, int(b * 1.15))
+            hover_color = f"#{hover_r:02x}{hover_g:02x}{hover_b:02x}"
+        except Exception:
+            pass
+
         self.style.map(
             "TButton",
-            background=[("active", palette["field"]), ("pressed", palette["field"])],
+            background=[("active", hover_color), ("pressed", palette["field"])],
             foreground=[("disabled", palette["muted"])],
+            bordercolor=[("active", palette["accent"])]
         )
+        
         self.style.configure("TCheckbutton", background=palette["bg"], foreground=palette["text"])
         self.style.configure("TRadiobutton", background=palette["bg"], foreground=palette["text"])
         self.style.configure("TEntry", fieldbackground=palette["field"], foreground=palette["text"])
@@ -2594,6 +3465,13 @@ class AntiAfkApp:
     def _rule_conditions_pass(self, condition: dict[str, Any], event: dict[str, Any]) -> bool:
         if not condition:
             return True
+        # v0.1.8: AND/OR composite conditions
+        or_block = condition.get("or")
+        if isinstance(or_block, list) and or_block:
+            return any(self._rule_conditions_pass(sub, event) for sub in or_block if isinstance(sub, dict))
+        and_block = condition.get("and")
+        if isinstance(and_block, list) and and_block:
+            return all(self._rule_conditions_pass(sub, event) for sub in and_block if isinstance(sub, dict))
         payload = event.get("payload", {})
         if not isinstance(payload, dict):
             payload = {}
@@ -2647,6 +3525,43 @@ class AntiAfkApp:
             return True
         if action_type in {"resume", "clear_pause"}:
             self.clear_manual_pause()
+            return True
+        if action_type == "play_sound":
+            try:
+                import winsound
+                sound = str(action.get("sound", "SystemExclamation")).strip()
+                winsound.PlaySound(sound, winsound.SND_ALIAS | winsound.SND_ASYNC)
+            except Exception as e:
+                self.log(f"Failed to play sound for rule '{rule_id}': {e}")
+            return True
+        if action_type == "close_instance":
+            target = str(action.get("target", "")).strip()
+            if not target or target == "self":
+                pid = payload.get("pid")
+                if pid:
+                    try:
+                        subprocess.run(["taskkill", "/F", "/PID", str(pid)], capture_output=True, creationflags=subprocess.CREATE_NO_WINDOW)
+                        self.log(f"Rule '{rule_id}' closed instance PID {pid}.")
+                    except Exception as e:
+                        self.log(f"Rule '{rule_id}' failed to close PID {pid}: {e}")
+                else:
+                    self.log(f"Rule '{rule_id}' could not close instance: no PID in payload.")
+            return True
+        if action_type == "run_script":
+            script = str(action.get("script", "")).strip()
+            if not script:
+                self.log(f"Rule '{rule_id}' run_script: no script path provided.")
+                return False
+            try:
+                subprocess.Popen(
+                    script,
+                    shell=True,
+                    close_fds=True,
+                    creationflags=subprocess.CREATE_NO_WINDOW,
+                )
+                self.log(f"Rule '{rule_id}' launched script: {script}")
+            except Exception as e:
+                self.log(f"Rule '{rule_id}' run_script failed: {e}")
             return True
         return False
 
@@ -2774,6 +3689,8 @@ class AntiAfkApp:
             self.recovery_timeline = self.recovery_timeline[-180:]
             self._refresh_recovery_history_view()
         self._refresh_event_history_view()
+        # v0.1.8: Feed analytics
+        self._record_analytics_event(event_type, {"message": message, **(payload or {})})
         if evaluate_rules:
             self._evaluate_rules_for_event(event)
 
@@ -3030,6 +3947,7 @@ class AntiAfkApp:
             "recovery": self.webhook_recovery_url_var.get().strip(),
             "health": self.webhook_health_url_var.get().strip(),
             "vendor": self.webhook_vendor_url_var.get().strip(),
+            "relaunch": self.webhook_relaunch_url_var.get().strip(),
         }
 
     def _configured_webhook_urls(self) -> list[str]:
@@ -3095,7 +4013,7 @@ class AntiAfkApp:
                         "title": title,
                         "description": description,
                         "color": 0x4FC3F7,
-                        "timestamp": datetime.utcnow().isoformat() + "Z",
+                        "timestamp": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
                     }
                 ]
             }
@@ -3492,6 +4410,10 @@ class AntiAfkApp:
             pass
         self.runtime_rules_mode_enabled = bool(self.rules_mode_enabled_var.get())
         self._refresh_rules_status()
+        # v0.1.8: Sync new runtime flags
+        self.runtime_smart_freeze_enabled = bool(self.smart_freeze_enabled_var.get())
+        self.runtime_error_screen_detection_enabled = bool(self.error_screen_detection_enabled_var.get())
+        self.runtime_discord_rpc_enabled = bool(self.discord_rpc_enabled_var.get())
 
     def parse_interval(self) -> float:
         raw = self.interval_var.get().strip()
@@ -4538,7 +5460,7 @@ class AntiAfkApp:
         force_closed = 0
         force_matched = 0
         debug_ok = self._ensure_debug_privilege()
-        if after in {"present", "inaccessible"} and debug_ok:
+        if after in {"present", "inaccessible"}:
             force_closed, force_matched = self._close_singleton_event_handles_for_pids(due_pids)
             after = self._probe_roblox_singleton_event_state()
             if after in {"present", "inaccessible"}:
@@ -5475,6 +6397,19 @@ class AntiAfkApp:
             self.refresh_instance_list(manual=False)
         self.refresh_identity_reliability_panel()
 
+    def _rename_selected_instance(self) -> None:
+        if not hasattr(self, "instance_tree"):
+            return
+        selected = self.instance_tree.selection()
+        if not selected:
+            messagebox.showinfo("Rename", "Select an instance row first.")
+            return
+        try:
+            hwnd = int(selected[0])
+        except ValueError:
+            return
+        self.rename_instance(hwnd)
+
     def on_instance_selection_changed(self, _event: tk.Event | None = None) -> None:
         self.refresh_identity_reliability_panel()
 
@@ -6319,6 +7254,12 @@ class AntiAfkApp:
 
     def _launch_roblox_instance(self) -> bool:
         target = self.runtime_instance_relaunch_launch_target.strip()
+        # v0.1.8: Private server auto-rejoin — build deep link if configured
+        ps_place = self.private_server_place_id_var.get().strip()
+        ps_code = self.private_server_code_var.get().strip()
+        if not target and ps_place and ps_code:
+            target = f"roblox://placeId={ps_place}&linkCode={ps_code}"
+            self.log(f"Auto-relaunch using private server deep link: placeId={ps_place}")
         try:
             if target:
                 if os.name == "nt":
@@ -6510,11 +7451,9 @@ class AntiAfkApp:
                     f"Auto-relaunch started {launched} Roblox instance(s) for missing roster account(s): {labels}."
                 )
                 self._record_event(f"Auto-relaunch x{launched} (roster)")
-                self._send_webhook(
-                    f"{APP_NAME} Auto Relaunch",
-                    f"Started {launched} relaunch attempt(s); roster missing {uncovered_missing}/{target_count}.",
-                    channel="recovery",
-                )
+                roster_msg = f"Started {launched} relaunch attempt(s); roster missing {uncovered_missing}/{target_count}."
+                self._send_webhook(f"{APP_NAME} Auto Relaunch", roster_msg, channel="recovery")
+                self._send_webhook(f"{APP_NAME} Auto Relaunch", roster_msg, channel="relaunch")
                 self._set_instance_relaunch_status(
                     f"Relaunch started x{launched}; roster missing {uncovered_missing}/{target_count}."
                 )
@@ -6687,11 +7626,9 @@ class AntiAfkApp:
                 f"(detected {current_count}/{self.instance_relaunch_target_count})."
             )
             self._record_event(f"Auto-relaunch x{launched}")
-            self._send_webhook(
-                f"{APP_NAME} Auto Relaunch",
-                f"Started {launched} relaunch attempt(s) at {current_count}/{self.instance_relaunch_target_count}.",
-                channel="recovery",
-            )
+            relaunch_msg = f"Started {launched} relaunch attempt(s) at {current_count}/{self.instance_relaunch_target_count}."
+            self._send_webhook(f"{APP_NAME} Auto Relaunch", relaunch_msg, channel="recovery")
+            self._send_webhook(f"{APP_NAME} Auto Relaunch", relaunch_msg, channel="relaunch")
             self._set_instance_relaunch_status(
                 f"Relaunch started x{launched}; waiting for clients ({current_count}/{self.instance_relaunch_target_count})."
             )
@@ -7145,6 +8082,13 @@ class AntiAfkApp:
             mm = (runtime % 3600) // 60
             ss = runtime % 60
             self.stats_var.set(f"Runtime {hh:02d}:{mm:02d}:{ss:02d} | Cycles {cycles} | Jumps {jumps} | Errors {errors}")
+            # v0.1.8: Auto-refresh analytics every ~10s
+            if not hasattr(self, "_analytics_refresh_counter"):
+                self._analytics_refresh_counter = 0
+            self._analytics_refresh_counter += 1
+            if self._analytics_refresh_counter >= 10 and hasattr(self, "analytics_summary_var"):
+                self._analytics_refresh_counter = 0
+                self._refresh_analytics_display()
         except Exception as exc:
             now = time.time()
             if (now - self.last_ui_poll_error_at) >= 5.0:
@@ -7179,6 +8123,11 @@ class AntiAfkApp:
                 self._poll_biome_tracker()
                 self._maybe_send_biome_alert(self.current_biome_name)
                 self._refresh_rules_status()
+                # v0.1.8: Periodic checks
+                self._check_roblox_error_screens()
+                self._smart_freeze_tick()
+                self._discord_rpc_update()
+                self._apply_persistent_pins_to_session()
             self._check_profile_scheduler()
             self._check_instance_health_alerts()
             if not iconic:
@@ -7389,6 +8338,13 @@ class AntiAfkApp:
             "instance_interval_override_by_pid": {str(pid): value for pid, value in interval_override_snapshot.items()},
             "instance_pattern_override_by_pid": {str(pid): value for pid, value in pattern_override_snapshot.items()},
             "instance_priority_by_pid": {str(pid): value for pid, value in priority_snapshot.items()},
+            "persistent_pins_enabled": bool(self.persistent_pins_enabled_var.get()),
+            "instance_alias_by_username": dict(self.instance_alias_by_username),
+            "per_account_limiter_profiles": dict(self.per_account_limiter_profiles),
+            "smart_freeze_enabled": bool(self.smart_freeze_enabled_var.get()),
+            "error_screen_detection_enabled": bool(self.error_screen_detection_enabled_var.get()),
+            "discord_rpc_enabled": bool(self.discord_rpc_enabled_var.get()),
+            "webhook_relaunch_url": self.webhook_relaunch_url_var.get().strip(),
         }
 
     def _normalize_config_payload(self, raw: dict[str, Any]) -> tuple[dict[str, Any], bool]:
@@ -7633,6 +8589,18 @@ class AntiAfkApp:
         if hasattr(self, "rules_history_list"):
             self.rules_history_list.delete(0, tk.END)
         self.rules_last_match_var.set("Last rule: -")
+        # v0.1.8: Load new settings
+        self.persistent_pins_enabled_var.set(bool(data.get("persistent_pins_enabled", False)))
+        raw_aliases = data.get("instance_alias_by_username", {})
+        if isinstance(raw_aliases, dict):
+            self.instance_alias_by_username = {str(k).lower(): str(v) for k, v in raw_aliases.items() if isinstance(v, str)}
+        raw_profiles = data.get("per_account_limiter_profiles", {})
+        if isinstance(raw_profiles, dict):
+            self.per_account_limiter_profiles = {str(k).lower(): v for k, v in raw_profiles.items() if isinstance(v, dict)}
+        self.smart_freeze_enabled_var.set(bool(data.get("smart_freeze_enabled", False)))
+        self.error_screen_detection_enabled_var.set(bool(data.get("error_screen_detection_enabled", False)))
+        self.discord_rpc_enabled_var.set(bool(data.get("discord_rpc_enabled", False)))
+        self.webhook_relaunch_url_var.set(str(data.get("webhook_relaunch_url", "")).strip())
         self._apply_selected_theme()
         self._sync_runtime_settings_from_ui()
         self._set_global_hotkeys_enabled(self.hotkeys_enabled_var.get(), log_result=False)
@@ -8400,6 +9368,10 @@ class AntiAfkApp:
         self.stop()
         self._stop_process_limiter_worker()
         self._write_recovery_snapshot(force=True)
+        # v0.1.8: Save persistent pins and disconnect Discord RPC on close
+        if self.persistent_pins_enabled_var.get():
+            self.persist_current_pins()
+        self._discord_rpc_disconnect()
         self.save_config()
         self._write_session_report("shutdown")
         self._unregister_global_hotkeys()

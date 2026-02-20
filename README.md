@@ -138,8 +138,17 @@ pip install pystray pillow
 - Rules MVP (Phase 1): in-process trigger/condition/action automation with cooldown/debounce and compact runtime status.
 - Identity Reliability Center (Phase 2 MVP): per-instance confidence reasons, conflict/retry telemetry, quick retry/clear actions, and session-only PID→identity pinning.
 - Relaunch Playbooks + tracing (Phase 3 MVP): Conservative/Balanced/Aggressive presets, cooldown pacing, and explainable relaunch decision reasons exported in diagnostics/support bundles.
+- **Rules Engine Phase 2**: Visual Rule Builder dialog, composite AND/OR conditions, and new actions (`play_sound`, `close_instance`, `run_script`).
+- **Identity Center (v0.1.8)**: Persistent identity pins across restarts, instance aliasing/renaming, and save/clear pin controls.
+- **Per-Account Performance Profiles**: Account-specific duty-cycle overrides and Smart Freeze (auto-unfreeze foreground Roblox window).
+- **Roblox Error Screen Detection**: Auto-detects error codes 277/268/279/264 and terminates for relaunch.
+- **Private Server Auto-Rejoin**: Deep-link relaunch using configured place ID + link code.
+- **Session Analytics Dashboard**: Dedicated Analytics tab with 24h event timeline, summary stats, and uptime graph.
+- **Discord Rich Presence**: Optional RPC integration showing account count and uptime on your Discord profile.
+- **In-App Seamless Updating**: One-click download, replace, and restart from within the app.
+- **Relaunch Webhook Channel**: Dedicated webhook URL for relaunch-specific notifications.
 
-## Rules MVP (Phase 1)
+## Rules Engine (Phase 2)
 
 Rules mode adds a lightweight in-process automation layer driven by normalized app events.
 
@@ -153,17 +162,23 @@ Rules mode adds a lightweight in-process automation layer driven by normalized a
 - Rules engine capabilities:
   - Trigger matching (`type/category/severity/source`, optional `type_prefix`, optional message `contains`)
   - Optional condition checks (`runtime_running`, payload-key checks with `equals`/`not_equals`/`in`, optional `contains`)
-  - Actions (MVP):
+  - **Composite conditions** (v0.1.8): `and` / `or` blocks for combining multiple condition checks
+  - Actions:
     - `send_webhook`
     - `load_preset`
     - `pause` / `pause_for_minutes`
     - `resume` / `clear_pause`
+    - `play_sound` (v0.1.8)
+    - `close_instance` (v0.1.8)
+    - `run_script` (v0.1.8)
   - Cooldown and debounce controls per rule (`cooldown_seconds`, `debounce_seconds`)
+- **Visual Rule Builder** (v0.1.8): GUI dialog for creating rules with dropdowns for triggers, conditions, and actions — no JSON editing required.
 
 ### Usage
 
-- Open **Dashboard → Automation → Rules (MVP)**.
+- Open **Dashboard → Automation → Rules Engine**.
 - Enable **Rules mode** to activate evaluation.
+- Click **Visual Rule Builder** to create rules interactively.
 - Optionally enable **Verbose rule logs** for skip reasons (cooldown/debounce).
 - Rules definitions are persisted in config under `rules_definitions` and validated on load.
 
@@ -172,7 +187,7 @@ Rules mode adds a lightweight in-process automation layer driven by normalized a
 - Rules are **default-off** and do not alter behavior until enabled.
 - Rules run in-process and are intentionally minimal for stability.
 - Invalid rule entries are ignored during load normalization.
-- The current MVP is schema-light by design; future phases may add a richer editor/schema.
+- `run_script` executes shell commands — use with care and only with trusted scripts.
 
 ## Identity Reliability Center (Phase 2 MVP)
 
@@ -185,7 +200,42 @@ Rules mode adds a lightweight in-process automation layer driven by normalized a
   - **Retry Identity**
   - **Clear Identity Cache**
   - **Pin Session** / **Unpin Session**
-- Session pins are in-memory only (not persisted to config) and are auto-invalidated when the PID exits.
+- Session pins are in-memory only by default and are auto-invalidated when the PID exits.
+- **Persistent pins** (v0.1.8): Optionally persist identity pins across restarts with save/clear controls.
+- **Instance aliasing** (v0.1.8): Rename instances with custom labels that persist by username.
+
+## Per-Account Performance Profiles (v0.1.8)
+
+- Assign account-specific duty-cycle overrides (target %, cycle ms) via the **Per-Account Profiles** editor.
+- **Smart Freeze**: Automatically unfreezes the foreground Roblox window and freezes background instances for seamless interaction.
+- Profiles are keyed by username and persist across config save/load.
+
+## Error Screen Detection & Private Server Rejoin (v0.1.8)
+
+- **Error screen detection**: Scans Roblox window titles for error codes `277`, `268`, `279`, `264` and auto-terminates affected instances for relaunch.
+- **Private server auto-rejoin**: When a place ID and link code are configured, relaunched instances use a `roblox://` deep link to rejoin the same private server automatically.
+- Detection runs on the main poll loop and respects a per-PID cooldown to avoid spam.
+
+## Session Analytics (v0.1.8)
+
+- Dedicated **Analytics** tab with:
+  - Session summary (uptime, biome changes, crashes/relaunches, jump cycles, total events)
+  - Scrollable event timeline (last 100 events, newest first)
+  - Uptime graph (last 24h) rendered on a canvas
+- All internal events are automatically fed into the analytics store.
+- Auto-refreshes every ~10 seconds; manual refresh button also available.
+
+## Discord Rich Presence (v0.1.8)
+
+- Optional toggle in **Alerts** tab to show StayActive status on your Discord profile.
+- Displays account count and session uptime via Discord IPC.
+- Automatically connects/disconnects; cleanly disconnects on app close.
+
+## In-App Seamless Updating (v0.1.8)
+
+- **Update & Restart** button in the Quick Start action bar.
+- Downloads the latest release EXE from GitHub, replaces the current binary, and restarts the app.
+- Falls back to opening the release page if the seamless flow fails.
 
 ## Relaunch Playbooks + Decision Tracing (Phase 3 MVP)
 
@@ -197,6 +247,25 @@ Rules mode adds a lightweight in-process automation layer driven by normalized a
 - Added decision tracing for relaunch state transitions (`no-op`, `cooldown`, `launch`, `cap`).
 - Latest relaunch reason is surfaced in UI and included in diagnostics/support artifacts.
 - Debug/support exports now include structured relaunch trace + identity telemetry snapshots.
+
+## Patch Notes (v0.1.8)
+
+- Added **Rules Engine Phase 2** with Visual Rule Builder dialog, composite AND/OR conditions, and new actions (`play_sound`, `close_instance`, `run_script`).
+- Added **Identity Center (v0.1.8)** with persistent identity pins across restarts, instance aliasing/renaming, and save/clear pin management.
+- Added **Per-Account Performance Profiles** with account-specific duty-cycle overrides and a dedicated editor dialog.
+- Added **Smart Freeze** that auto-unfreezes the foreground Roblox window and freezes background instances.
+- Added **Roblox Error Screen Detection** for error codes 277/268/279/264 with auto-terminate for relaunch.
+- Added **Private Server Auto-Rejoin** using `roblox://` deep links when place ID and link code are configured.
+- Added **Session Analytics Dashboard** (new Analytics tab) with 24h event timeline, summary stats, and uptime graph.
+- Added **Discord Rich Presence** integration showing account count and session uptime on your Discord profile.
+- Added **In-App Seamless Updating** with one-click download, replace, and restart.
+- Added dedicated **Relaunch Webhook URL** channel for relaunch-specific notifications.
+- Added relaunch webhook notifications on both roster-based and count-based relaunch events.
+- All internal events now feed into the analytics store for unified session visibility.
+- Analytics auto-refreshes every ~10 seconds alongside the stats update loop.
+- Persistent pins are loaded on startup and saved on close when enabled.
+- Discord RPC cleanly disconnects on app close.
+- Config save/load updated to persist all new v0.1.8 settings.
 
 ## Patch Notes (v0.1.7)
 
@@ -280,10 +349,10 @@ Output: `dist/StayActive.exe`
 After building and validating `dist/StayActive.exe`, publish the release from repo root:
 
 ```powershell
-git tag v0.1.7
+git tag v0.1.8
 git push origin main
-git push origin v0.1.7
-gh release create v0.1.7 dist/StayActive.exe --title "StayActive v0.1.7" --notes-file RELEASE_NOTES_v0.1.7.md
+git push origin v0.1.8
+gh release create v0.1.8 dist/StayActive.exe --title "StayActive v0.1.8" --notes-file RELEASE_NOTES_v0.1.8.md
 ```
 
 ## Troubleshooting
